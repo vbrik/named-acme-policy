@@ -1,3 +1,7 @@
+In a nutshell, this project allows to securely configure ISC bind for
+automatic certificate issuing using ACME DNS-01 challenge
+(for example https://letsencrypt.org/docs/challenge-types/#dns-01-challenge).
+
 This is an external named(8) update-policy decider daemon that allows dynamic
 DNS (RFC 2136) update requests if they are part of an Automatic Certificate
 Management Environment (ACME) DNS-01 challenge, for example, as used by Let's
