@@ -2,7 +2,7 @@
 """
 This is an external named(8) update-policy decider daemon that allows dynamic
 DNS update requests if they are part of an Automatic Certificate Management
-Environment (ACME) DNS-01 challenge, for example, as used by Let's Encrypt
+Environment (ACME) DNS-01 challenge, for example, as used by Let's Encrypt's
 certbot client. This daemon implements a more secure permissions model than the
 bult-in named(8) mechanisms allow.
 
@@ -24,6 +24,7 @@ import argparse
 import dns.resolver
 import logging
 import pickle
+import shutil
 import socket
 import struct
 import sys
@@ -74,7 +75,7 @@ def main():
         description="This is an external named(8) update-policy decider "
         "daemon that allows dynamic DNS update requests if they are part "
         "of an Automatic Certificate Management Environment (ACME) DNS-01 "
-        "challenge, for example as used by Let's Encrypt certbot client. "
+        "challenge, for example as used by Let's Encrypt's certbot client. "
         "This daemon implements a more secure permissions model than the "
         "bult-in named(8) mechanisms allow.",
         epilog="Notes: (A) For instructions on how to integrate this daemon "
@@ -100,7 +101,7 @@ def main():
     parser.add_argument(
         "--log-file",
         metavar="PATH",
-        help="path to log file; stdout if None",
+        help="log to PATH in addition to stderr",
     )
     parser.add_argument(
         "--dns",
@@ -116,6 +117,8 @@ def main():
         level=logging.INFO,
         format="%(asctime)-23s %(levelname)s %(message)s",
     )
+    if args.log_file:
+        logging.getLogger().addHandler(logging.StreamHandler())
 
     # External update-policy decision protocol is this:
     #   1. Named(8) writes a dynamic DNS update request message to the socket.
@@ -134,12 +137,14 @@ def main():
         parser.exit(1, f"--dns servers failed test: {e}\n")
 
     socket_path = Path(args.socket)
+    Path.mkdir(socket_path.parent, parents=True, exist_ok=True)
     if socket_path.exists():
         socket_path.unlink()
 
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     server.bind(str(socket_path))
-    socket_path.chmod(0o666)
+    socket_path.chmod(0o660)
+    shutil.chown(str(socket_path), "named", "named")
     server.listen()
 
     while True:
