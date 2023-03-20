@@ -1,9 +1,10 @@
 This is an external named(8) update-policy decider daemon that allows dynamic
 DNS (RFC 2136) update requests if they are part of an Automatic Certificate
 Management Environment (ACME) DNS-01 challenge, for example, as used by Let's
-Encrypt's certbot client. This daemon implements a more secure permissions
-model than the bult-in named(8) mechanisms allow for automated certificate
-issuance using DNS-01 challenge via RFC 2136.
+Encrypt's [certbot client](https://certbot-dns-rfc2136.readthedocs.io/en/stable/).
+This daemon implements a more secure permissions model than the bult-in named(8)
+mechanisms allow for automated certificate issuance using DNS-01 challenge via
+RFC 2136.
 
 The daemon allows dynamic DNS update if they meet the following criteria:
 * Name of the resource record being updates starts with `_acme-challenge.`.
