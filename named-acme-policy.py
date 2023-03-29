@@ -129,7 +129,7 @@ def main():
 
     resolver = dns.resolver.Resolver(configure=False)
     resolver.nameservers = args.dns
-    resolver.timeout = 0.2  # seconds to wait for a response from a server
+    resolver.timeout = 0.25  # seconds to wait for a response from a server
     resolver.lifetime = 0.5  # seconds to spend trying to get an answer
     try:
         resolver.query("google.com", "A")
