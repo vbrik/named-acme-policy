@@ -64,7 +64,12 @@ def is_valid_acme_update(msg, signer, resolver):
     if msg["signer"] != signer:
         logging.info(f"Request {msg} wasn't signed by {signer}")
         return False
-    if msg["src_addr"] not in [str(a) for a in resolver.query(domain, "A")]:
+    try:
+        domain_addrs = [str(a) for a in resolver.query(domain, "A")]
+    except dns.resolver.NoAnswer:
+        logging.error(f"Failed to resolve {domain}")
+        domain_addrs = []
+    if msg["src_addr"] not in domain_addrs:
         logging.info(f"Request {msg} did not originate from {domain}")
         return False
     return True
@@ -158,7 +163,13 @@ def main():
             conn.send(struct.pack("!I", 0))
             continue
         else:
-            if is_valid_acme_update(msg, args.signer, resolver):
+            logging.info(f"Unpacked request {msg}")
+            try:
+                grant = is_valid_acme_update(msg, args.signer, resolver)
+            except Exception as e:
+                logging.error(f"Validating {msg} resulted an exception: {e}")
+                grant = False
+            if grant:
                 logging.info(f"Granting request {msg}")
                 conn.send(struct.pack("!I", 1))
             else:
