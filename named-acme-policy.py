@@ -81,7 +81,7 @@ def is_valid_acme_update(msg, signer, resolver):
         return False
     try:
         rev_name = dns.reversename.from_address(msg["src_addr"])  # e.g. 8.8.8.8.in-addr.arpa
-        src_ptr_names = [str(a) for a in dns.resolver.resolve(rev_name, "PTR")]
+        src_ptr_names = [str(a) for a in dns.resolver.query(rev_name, "PTR")]
     except dns.resolver.NoAnswer:
         logging.warning(f"Reserve DNS lookup failed for {msg['src_addr']}.")
         src_ptr_names = []
