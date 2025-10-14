@@ -3,8 +3,8 @@
 This is an external named(8) update-policy decider daemon that allows dynamic
 DNS update requests if they are part of an Automatic Certificate Management
 Environment (ACME) DNS-01 challenge, for example, as used by Let's Encrypt's
-certbot client. This daemon implements a more secure permissions model than the
-bult-in named(8) mechanisms allow.
+certbot client. This daemon implements a *somewhat* more secure permissions
+model than the bult-in named(8) mechanisms allow.
 
 For instructions on how to integrate this daemon with named(8) see
 https://bind9.readthedocs.io/en/latest/reference.html#namedconf-statement-update-policy
@@ -22,8 +22,8 @@ IMPORTANT: Named(8) evaluates externally-decided policies synchronously
 """
 import argparse
 import dns.resolver
+import dns.reversename
 import logging
-import pickle
 import shutil
 import socket
 import struct
@@ -44,6 +44,7 @@ def unpack_req_msg(data):
     (1, 98, 'certbot', '_acme-challenge.bookstack.icecube.wisc.edu',
       '144.92.100.35', 'TXT', 'certbot/165/7089', 0, '')
     """
+    # rr stands for resource record
     signer, rr_name, src_addr, rr_type = data[8:].split(b"\x00")[0:4]
     return {
         "signer": signer.decode(),
@@ -55,22 +56,39 @@ def unpack_req_msg(data):
 
 def is_valid_acme_update(msg, signer, resolver):
     """Check if the message appears to be a valid ACME DNS-01 request,
-    and passes some security checks.
+    and passes some minimal security checks.
     """
+    # Example msg (rr stands for resource record):
+    # {'signer': 'certbot', 'src_addr': '10.128.11.214',
+    # 'rr_name': '_acme-challenge.dtn-2.icecube.wisc.edu', 'rr_type': 'TXT'}
     subdomain, domain = msg["rr_name"].split(".", 1)
     if subdomain != "_acme-challenge" or msg["rr_type"] != "TXT":
-        logging.info(f"{msg} doesn't look related to an ACME challenge")
+        logging.info(f"{msg} doesn't look related to an ACME challenge.")
         return False
     if msg["signer"] != signer:
-        logging.info(f"Request {msg} wasn't signed by {signer}")
+        logging.info(f"Request {msg} wasn't signed by {signer}/")
         return False
+
+    # Require that either (1) the request's source IP address is among the addresses
+    # the request's domain resolves to (this takes care of 1-to-1 and round-robin cases),
+    # OR (2) the reverse name of the request's source address resolves to the request's
+    # domain (this is for multi-homed cases, where the request comes from an internal
+    # address but the domain resolves to the external address).
     try:
         domain_addrs = [str(a) for a in resolver.query(domain, "A")]
     except dns.resolver.NoAnswer:
-        logging.error(f"Failed to resolve {domain}")
-        domain_addrs = []
-    if msg["src_addr"] not in domain_addrs:
-        logging.info(f"Request {msg} did not originate from {domain}")
+        logging.error(f"Failed to resolve {domain}.")
+        return False
+    try:
+        rev_name = dns.reversename.from_address(msg["src_addr"])  # e.g. 8.8.8.8.in-addr.arpa
+        src_ptr_names = [str(a) for a in dns.resolver.resolve(rev_name, "PTR")]
+    except dns.resolver.NoAnswer:
+        logging.warning(f"Reserve DNS lookup failed for {msg['src_addr']}.")
+        src_ptr_names = []
+    if msg["src_addr"] not in domain_addrs and domain + '.' not in src_ptr_names:
+        logging.info(f"Request {msg} failed to pass source security check:"
+                     f" {domain} doesn't resolve to {msg['src_addr']}"
+                     f" and {msg['src_addr']} doesn't resolve to {domain}")
         return False
     return True
 
@@ -81,8 +99,8 @@ def main():
         "daemon that allows dynamic DNS update requests if they are part "
         "of an Automatic Certificate Management Environment (ACME) DNS-01 "
         "challenge, for example as used by Let's Encrypt's certbot client. "
-        "This daemon implements a more secure permissions model than the "
-        "bult-in named(8) mechanisms allow.",
+        "This daemon implements a *somewhat* more secure permissions model "
+        "than the bult-in named(8) mechanisms allow.",
         epilog="Notes: (A) For instructions on how to integrate this daemon "
         "with named(8) see [1]. (B) Because externally-decided update-policy "
         "statements are executed synchronously, for request origin security "
