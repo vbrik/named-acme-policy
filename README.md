@@ -17,7 +17,9 @@ The daemon allows dynamic DNS updates if they meet the following criteria:
 resolves to the IP address from which the update request originated,
 OR (2) the request's source address resolves to the domain name of the
 challenge (this is for multi-homed cases, where the request comes from an internal
-address but the domain resolves to the external address).
+address but the domain resolves to the external address),
+OR (3) request's source address maps to the requested domain name in the
+static IP-FQDN mapping file.
 
 For instructions on how to integrate this daemon with named(8) see
 https://bind9.readthedocs.io/en/latest/reference.html#namedconf-statement-update-policy

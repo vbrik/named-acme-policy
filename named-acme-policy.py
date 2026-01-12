@@ -23,6 +23,7 @@ IMPORTANT: Named(8) evaluates externally-decided policies synchronously
 import argparse
 import dns.resolver
 import dns.reversename
+import json
 import logging
 import shutil
 import socket
@@ -54,7 +55,7 @@ def unpack_req_msg(data):
     }
 
 
-def is_valid_acme_update(msg, signer, resolver):
+def is_valid_acme_update(msg, signer, resolver, static_maps):
     """Check if the message appears to be a valid ACME DNS-01 request,
     and passes some minimal security checks.
     """
@@ -68,6 +69,9 @@ def is_valid_acme_update(msg, signer, resolver):
     if msg["signer"] != signer:
         logging.info(f"Request {msg} wasn't signed by {signer}/")
         return False
+
+    if domain in static_maps.get(msg["src_addr"], []):
+        return True
 
     # Require that either (1) the request's source IP address is among the addresses
     # the request's domain resolves to (this takes care of 1-to-1 and round-robin cases),
@@ -100,12 +104,22 @@ def main():
         "of an Automatic Certificate Management Environment (ACME) DNS-01 "
         "challenge, for example as used by Let's Encrypt's certbot client. "
         "This daemon implements a *somewhat* more secure permissions model "
-        "than the bult-in named(8) mechanisms allow.",
+        "than the bult-in named(8) mechanisms allow: see notes (C) and (D) "
+        "in the epilog.",
         epilog="Notes: (A) For instructions on how to integrate this daemon "
         "with named(8) see [1]. (B) Because externally-decided update-policy "
         "statements are executed synchronously, for request origin security "
         "check, this script needs to use a DNS server other than the one it's "
         "running on (to avoid deadlock). "
+        "(C) See code for the exact security requirements, but basically it comes "
+        "down to the IP address of the requestor bein associated "
+        "with the domain being requested: requestor address is among addresses the "
+        "domain resolves to, or requestor IP reverse-maps to the requested domain, "
+        "(also, see note (D)). "
+        "(D) Sometimes you need to pre-stage certificates on a machine that "
+        "doesn't meet the default IP-to-FQDN mapping requirements for security. "
+        "In these cases you can provide a static mapping of who can request which "
+        'domain using a JSON file. The format is {"ip1": ["fqdn1", "fqdn2"], ...}. ' 
         "[1] https://bind9.readthedocs.io/en/latest/reference.html#namedconf-statement-update-policy",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
@@ -133,6 +147,11 @@ def main():
         default=["8.8.8.8", "4.4.4.4"],
         help="different nameserver for address verification; see note (B)",
     )
+    parser.add_argument(
+        "--static-maps",
+        metavar="PATH",
+        help="path to the JSON file with static IP-FQDN mappings, see note (D)",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -148,7 +167,7 @@ def main():
     #   2. The external decider process writes 1 or 0 to the socket.
     #   3. Named(8) reads the socket and grants or denies the request.
     # Named(8) evaluates externally-decided policies synchronously (even name
-    # lookups will be blocked). Therefore we must be as quick as possible.
+    # lookups will be blocked). Therefore, we must be as quick as possible.
 
     resolver = dns.resolver.Resolver(configure=False)
     resolver.nameservers = args.dns
@@ -158,6 +177,12 @@ def main():
         resolver.query("google.com", "A")
     except Exception as e:
         parser.exit(1, f"--dns servers failed test: {e}\n")
+
+    if args.static_maps:
+        with open(args.static_maps) as f:
+            static_maps = json.load(f)
+    else:
+        static_maps = {}
 
     socket_path = Path(args.socket)
     Path.mkdir(socket_path.parent, parents=True, exist_ok=True)
@@ -183,7 +208,7 @@ def main():
         else:
             logging.info(f"Unpacked request {msg}")
             try:
-                grant = is_valid_acme_update(msg, args.signer, resolver)
+                grant = is_valid_acme_update(msg, args.signer, resolver, static_maps)
             except Exception as e:
                 logging.error(f"Validating {msg} resulted an exception: {e}")
                 grant = False
