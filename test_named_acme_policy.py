@@ -117,7 +117,7 @@ class TestIsValidAcmeUpdate:
             "rr_type": "TXT",
         }
         resolver = FakeResolver()
-        assert nap.is_valid_acme_update(msg, "certbot", resolver, {}) is False
+        assert nap.is_valid_acme_update(msg, {"certbot": {}}, resolver) is False
         assert resolver.calls == []
 
     def test_wrong_rr_type_denied_without_dns_lookup(self):
@@ -128,10 +128,10 @@ class TestIsValidAcmeUpdate:
             "rr_type": "A",
         }
         resolver = FakeResolver()
-        assert nap.is_valid_acme_update(msg, "certbot", resolver, {}) is False
+        assert nap.is_valid_acme_update(msg, {"certbot": {}}, resolver) is False
         assert resolver.calls == []
 
-    def test_wrong_signer_denied_without_dns_lookup(self):
+    def test_unconfigured_signer_denied_without_dns_lookup(self):
         msg = {
             "signer": "someone-else",
             "rr_name": "_acme-challenge.example.com",
@@ -139,12 +139,12 @@ class TestIsValidAcmeUpdate:
             "rr_type": "TXT",
         }
         resolver = FakeResolver()
-        assert nap.is_valid_acme_update(msg, "certbot", resolver, {}) is False
+        assert nap.is_valid_acme_update(msg, {"certbot": {}}, resolver) is False
         assert resolver.calls == []
 
-    def test_wrong_signer_denied_even_with_static_map_hit(self):
-        # Signer check must precede the static-map shortcut: a static mapping
-        # authorizes a source IP for a domain, but only once signed correctly.
+    def test_unconfigured_signer_denied_even_with_static_map_hit(self):
+        # Signer lookup must precede the static-map shortcut: a static mapping
+        # authorizes a source IP for a domain, but only under a configured signer.
         msg = {
             "signer": "someone-else",
             "rr_name": "_acme-challenge.example.com",
@@ -152,8 +152,8 @@ class TestIsValidAcmeUpdate:
             "rr_type": "TXT",
         }
         resolver = FakeResolver()
-        static_maps = {"10.0.0.1": ["example.com"]}
-        assert nap.is_valid_acme_update(msg, "certbot", resolver, static_maps) is False
+        signers = {"certbot": {"10.0.0.1": ["example.com"]}}
+        assert nap.is_valid_acme_update(msg, signers, resolver) is False
         assert resolver.calls == []
 
     def test_static_map_hit_grants_without_dns_lookup(self):
@@ -164,9 +164,49 @@ class TestIsValidAcmeUpdate:
             "rr_type": "TXT",
         }
         resolver = FakeResolver()
-        static_maps = {"10.0.0.1": ["other.example.org", "example.com"]}
-        assert nap.is_valid_acme_update(msg, "certbot", resolver, static_maps) is True
+        signers = {"certbot": {"10.0.0.1": ["other.example.org", "example.com"]}}
+        assert nap.is_valid_acme_update(msg, signers, resolver) is True
         assert resolver.calls == []
+
+    def test_wildcard_static_map_entry_grants_any_domain(self):
+        msg = {
+            "signer": "k8s-certbot",
+            "rr_name": "_acme-challenge.anything.example.net",
+            "src_addr": "10.1.2.3",
+            "rr_type": "TXT",
+        }
+        resolver = FakeResolver()
+        signers = {"k8s-certbot": {"10.1.2.3": "*"}}
+        assert nap.is_valid_acme_update(msg, signers, resolver) is True
+        assert resolver.calls == []
+
+    def test_wildcard_entry_for_other_ip_does_not_grant_unlisted_ip(self):
+        # A signer's wildcard grant is scoped to the specific IPs listed for
+        # it; a request from an IP that isn't in its map at all still falls
+        # through to the normal resolver-based check.
+        msg = {
+            "signer": "k8s-certbot",
+            "rr_name": "_acme-challenge.example.com",
+            "src_addr": "192.168.1.1",
+            "rr_type": "TXT",
+        }
+        resolver = FakeResolver(a_records=["203.0.113.5"], ptr_records=["other.com."])
+        signers = {"k8s-certbot": {"10.1.2.3": "*"}}
+        assert nap.is_valid_acme_update(msg, signers, resolver) is False
+
+    def test_malformed_bare_string_map_value_does_not_substring_match(self):
+        # A map value must be "*" or a list of domains. A bare domain string
+        # (e.g. forgetting the list brackets) must not be treated as a grant
+        # via Python's `in` substring containment on the request's domain.
+        msg = {
+            "signer": "certbot",
+            "rr_name": "_acme-challenge.ample.com",
+            "src_addr": "10.0.0.1",
+            "rr_type": "TXT",
+        }
+        resolver = FakeResolver(a_records=["203.0.113.5"], ptr_records=["other.com."])
+        signers = {"certbot": {"10.0.0.1": "example.com"}}
+        assert nap.is_valid_acme_update(msg, signers, resolver) is False
 
     def test_static_map_present_but_no_matching_domain_falls_through_to_dns(self):
         msg = {
@@ -176,8 +216,8 @@ class TestIsValidAcmeUpdate:
             "rr_type": "TXT",
         }
         resolver = FakeResolver(a_records=["10.0.0.1"])
-        static_maps = {"10.0.0.1": ["unrelated.example.org"]}
-        assert nap.is_valid_acme_update(msg, "certbot", resolver, static_maps) is True
+        signers = {"certbot": {"10.0.0.1": ["unrelated.example.org"]}}
+        assert nap.is_valid_acme_update(msg, signers, resolver) is True
 
     def test_forward_resolution_match_grants(self):
         msg = {
@@ -187,7 +227,7 @@ class TestIsValidAcmeUpdate:
             "rr_type": "TXT",
         }
         resolver = FakeResolver(a_records=["10.0.0.1", "10.0.0.2"])
-        assert nap.is_valid_acme_update(msg, "certbot", resolver, {}) is True
+        assert nap.is_valid_acme_update(msg, {"certbot": {}}, resolver) is True
 
     def test_reverse_resolution_match_grants_multihomed_case(self):
         msg = {
@@ -199,7 +239,7 @@ class TestIsValidAcmeUpdate:
         # Forward lookup returns only the public address; source is an
         # internal address whose PTR record points back to the domain.
         resolver = FakeResolver(a_records=["203.0.113.5"], ptr_records=["example.com."])
-        assert nap.is_valid_acme_update(msg, "certbot", resolver, {}) is True
+        assert nap.is_valid_acme_update(msg, {"certbot": {}}, resolver) is True
         # The PTR lookup must go through the injected resolver, not the
         # module-level dns.resolver.query, per note (B) in the --help epilog.
         assert [(str(name), rdtype) for name, rdtype in resolver.calls] == [
@@ -216,7 +256,7 @@ class TestIsValidAcmeUpdate:
         }
         # Missing the trailing dot that a real PTR RRset would have.
         resolver = FakeResolver(a_records=["203.0.113.5"], ptr_records=["example.com"])
-        assert nap.is_valid_acme_update(msg, "certbot", resolver, {}) is False
+        assert nap.is_valid_acme_update(msg, {"certbot": {}}, resolver) is False
 
     def test_neither_forward_nor_reverse_match_denies(self):
         msg = {
@@ -228,7 +268,7 @@ class TestIsValidAcmeUpdate:
         resolver = FakeResolver(
             a_records=["203.0.113.5"], ptr_records=["other-domain.com."]
         )
-        assert nap.is_valid_acme_update(msg, "certbot", resolver, {}) is False
+        assert nap.is_valid_acme_update(msg, {"certbot": {}}, resolver) is False
 
     def test_forward_resolution_no_answer_denies(self):
         msg = {
@@ -238,7 +278,7 @@ class TestIsValidAcmeUpdate:
             "rr_type": "TXT",
         }
         resolver = FakeResolver(raise_on_a=dns.resolver.NoAnswer())
-        assert nap.is_valid_acme_update(msg, "certbot", resolver, {}) is False
+        assert nap.is_valid_acme_update(msg, {"certbot": {}}, resolver) is False
 
     def test_forward_resolution_nxdomain_propagates(self):
         # NXDOMAIN is not a subclass of NoAnswer, so the except clause
@@ -252,7 +292,7 @@ class TestIsValidAcmeUpdate:
         }
         resolver = FakeResolver(raise_on_a=dns.resolver.NXDOMAIN())
         with pytest.raises(dns.resolver.NXDOMAIN):
-            nap.is_valid_acme_update(msg, "certbot", resolver, {})
+            nap.is_valid_acme_update(msg, {"certbot": {}}, resolver)
 
     def test_ptr_lookup_no_answer_treated_as_empty_and_falls_back_to_forward(self):
         msg = {
@@ -264,7 +304,7 @@ class TestIsValidAcmeUpdate:
         resolver = FakeResolver(
             a_records=["10.0.0.1"], raise_on_ptr=dns.resolver.NoAnswer()
         )
-        assert nap.is_valid_acme_update(msg, "certbot", resolver, {}) is True
+        assert nap.is_valid_acme_update(msg, {"certbot": {}}, resolver) is True
 
     def test_ptr_lookup_no_answer_and_no_forward_match_denies(self):
         msg = {
@@ -276,7 +316,7 @@ class TestIsValidAcmeUpdate:
         resolver = FakeResolver(
             a_records=["203.0.113.5"], raise_on_ptr=dns.resolver.NoAnswer()
         )
-        assert nap.is_valid_acme_update(msg, "certbot", resolver, {}) is False
+        assert nap.is_valid_acme_update(msg, {"certbot": {}}, resolver) is False
 
     def test_malformed_rr_name_without_dot_raises(self):
         # split(".", 1) yields a single element; unpacking into
@@ -289,7 +329,7 @@ class TestIsValidAcmeUpdate:
         }
         resolver = FakeResolver()
         with pytest.raises(ValueError):
-            nap.is_valid_acme_update(msg, "certbot", resolver, {})
+            nap.is_valid_acme_update(msg, {"certbot": {}}, resolver)
 
     def test_non_ip_src_addr_raises_on_reverse_lookup(self):
         # dns.reversename.from_address requires a parseable IP address;
@@ -303,4 +343,4 @@ class TestIsValidAcmeUpdate:
         }
         resolver = FakeResolver(a_records=["203.0.113.5"])
         with pytest.raises(Exception):  # noqa: B017 -- dnspython's own error type
-            nap.is_valid_acme_update(msg, "certbot", resolver, {})
+            nap.is_valid_acme_update(msg, {"certbot": {}}, resolver)

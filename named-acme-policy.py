@@ -59,7 +59,7 @@ def unpack_req_msg(data):
     }
 
 
-def is_valid_acme_update(msg, signer, resolver, static_maps):
+def is_valid_acme_update(msg, signers, resolver):
     """Check if the message appears to be a valid ACME DNS-01 request,
     and passes some minimal security checks.
     """
@@ -70,11 +70,14 @@ def is_valid_acme_update(msg, signer, resolver, static_maps):
     if subdomain != "_acme-challenge" or msg["rr_type"] != "TXT":
         logger.info(f"{msg} doesn't look related to an ACME challenge.")
         return False
-    if msg["signer"] != signer:
-        logger.info(f"Request {msg} wasn't signed by {signer}/")
+    maps = signers.get(msg["signer"])
+    if maps is None:
+        logger.info(f"Request {msg} signed by unconfigured signer {msg['signer']!r}.")
         return False
 
-    if domain in static_maps.get(msg["src_addr"], []):
+    allowed = maps.get(msg["src_addr"], [])
+    if allowed == "*" or (isinstance(allowed, list) and domain in allowed):
+        logger.info(f"Granting {msg} via static map for signer {msg['signer']!r}.")
         return True
 
     # Require that either (1) the request's source IP address is among the addresses
@@ -102,6 +105,9 @@ def is_valid_acme_update(msg, signer, resolver, static_maps):
             f" and {msg['src_addr']} doesn't resolve to {domain}"
         )
         return False
+    logger.info(
+        f"Granting {msg} via source-address verification for signer {msg['signer']!r}."
+    )
     return True
 
 
@@ -124,10 +130,10 @@ def main():
         "with the domain being requested: requestor address is among addresses the "
         "domain resolves to, or requestor IP reverse-maps to the requested domain, "
         "(also, see note (D)). "
-        "(D) Sometimes you need to pre-stage certificates on a machine that "
-        "doesn't meet the default IP-to-FQDN mapping requirements for security. "
-        "In these cases you can provide a static mapping of who can request which "
-        'domain using a JSON file. The format is {"ip1": ["fqdn1", "fqdn2"], ...}. '
+        "(D) --signer-maps is a JSON file of per-signer static IP-to-domain "
+        'overrides: {"signer": {"ip": ["fqdn", ...]}}. An unlisted signer is '
+        'denied. An IP\'s value can instead be the literal "*" to grant that signer '
+        "any domain from that IP. "
         "[1] https://bind9.readthedocs.io/en/latest/reference.html#namedconf-statement-update-policy",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
@@ -136,12 +142,6 @@ def main():
         metavar="SOCKET_PATH",
         required=True,
         help="path to the Unix socket file for communication with named(8)",
-    )
-    parser.add_argument(
-        "--signer",
-        metavar="NAME",
-        default="certbot",
-        help="TSIG key identifier permitted to issue ACME requests",
     )
     parser.add_argument(
         "--log-file",
@@ -156,9 +156,11 @@ def main():
         help="different nameserver for address verification; see note (B)",
     )
     parser.add_argument(
-        "--static-maps",
+        "--signer-maps",
         metavar="PATH",
-        help="path to the JSON file with static IP-FQDN mappings, see note (D)",
+        help="JSON file of per-signer static IP-FQDN overrides, see note (D) "
+        '(default: %(default)s, i.e. only signer "certbot" is accepted, '
+        "with no overrides)",
     )
     args = parser.parse_args()
 
@@ -186,11 +188,11 @@ def main():
     except Exception as e:  # noqa: BLE001 -- any failure here should abort startup
         parser.exit(1, f"--dns servers failed test: {e}\n")
 
-    if args.static_maps:
-        with open(args.static_maps) as f:
-            static_maps = json.load(f)
+    if args.signer_maps:
+        with open(args.signer_maps) as f:
+            signers = json.load(f)
     else:
-        static_maps = {}
+        signers = {"certbot": {}}
 
     socket_path = Path(args.socket)
     Path.mkdir(socket_path.parent, parents=True, exist_ok=True)
@@ -218,7 +220,7 @@ def main():
         else:
             logger.info(f"Unpacked request {msg}")
             try:
-                grant = is_valid_acme_update(msg, args.signer, resolver, static_maps)
+                grant = is_valid_acme_update(msg, signers, resolver)
             # Same fail-safe reasoning as above: never let validation crash the daemon.
             except Exception as e:  # noqa: BLE001
                 logger.error(f"Validating {msg} resulted an exception: {e}")
