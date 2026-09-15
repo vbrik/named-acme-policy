@@ -1,10 +1,12 @@
 """Unit tests for named-acme-policy.py.
 
-The script's filename contains hyphens, so it can't be `import`ed normally;
-it is loaded via `importlib` from `conftest.py`-free fixtures below instead.
+The script's hyphenated filename can't be `import`ed, so `_load_module` below
+loads it through a custom loader that also skips the bytecode cache.
 """
 
+import importlib.machinery
 import importlib.util
+import os
 import re
 from pathlib import Path
 
@@ -14,9 +16,31 @@ import pytest
 MODULE_PATH = Path(__file__).parent / "named-acme-policy.py"
 
 
-def _load_module():
-    spec = importlib.util.spec_from_file_location("named_acme_policy", MODULE_PATH)
+class _UncachedLoader(importlib.machinery.SourceFileLoader):
+    """SourceFileLoader that always compiles from source.
+
+    The inherited `get_code` consults `__pycache__`, and CPython accepts a
+    cached `.pyc` whenever the source's size and whole-second mtime match the
+    values in its header. An edit preserving byte count that lands in the same
+    second as the previous run satisfies both, so the suite would silently
+    execute bytecode for code no longer on disk.
+    """
+
+    def get_code(self, fullname):
+        # Delegate the compile so this keeps CPython's dont_inherit=True --
+        # otherwise a __future__ import in this test module would change how
+        # the module under test is compiled.
+        return self.source_to_code(self.get_data(self.path), self.path)
+
+
+def _load_module(path=MODULE_PATH):
+    """Load a hyphen-named script as a module, ignoring any bytecode cache."""
+    name = path.stem.replace("-", "_")
+    loader = _UncachedLoader(name, str(path))
+    spec = importlib.util.spec_from_file_location(name, path, loader=loader)
     assert spec and spec.loader
+    # module_from_spec sets __name__, so the `if __name__ == "__main__"` guard
+    # still keeps main() from running at import time.
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -408,3 +432,19 @@ class TestHelpOutput:
         default = nap.build_parser().parse_args(["--socket", "/nonexistent"]).dns
         out, _ = _capture_exiting_output(["--help"], capsys)
         assert f"default: {' '.join(default)}" in " ".join(out.split())
+
+
+class TestModuleLoader:
+    def test_does_not_execute_stale_bytecode(self, tmp_path):
+        # CPython validates a cached .pyc on (source size, source mtime in
+        # whole seconds). Edit a file without changing its length, inside the
+        # same second as the last load, and both fields still match -- so a
+        # cache-consulting loader would hand back the previous version.
+        probe = tmp_path / "stale-probe.py"
+        probe.write_text("VALUE = 'aaa'\n")
+        assert _load_module(probe).VALUE == "aaa"
+
+        before = probe.stat()
+        probe.write_text("VALUE = 'bbb'\n")  # same byte count
+        os.utime(probe, (before.st_atime, before.st_mtime))
+        assert _load_module(probe).VALUE == "bbb"
