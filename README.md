@@ -34,3 +34,11 @@ configuration file:
 ```
 (the '*' is there just to satisfy the config parser: replacing it with any other
 string wouldn't change anything.)
+
+## Testing
+
+Unit tests cover request parsing and the update-approval logic. Run them with:
+```
+pip install -r requirements.txt pytest
+pytest
+```
