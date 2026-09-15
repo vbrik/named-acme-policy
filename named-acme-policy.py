@@ -12,7 +12,7 @@ Basically this comes down to having something like the following in a zone
 configuration file:
     ...
     update-policy {
-        grant "local:/path/to/socket" external *; 
+        grant "local:/path/to/socket" external *;
     ...
 (the '*' is there just to satisfy the config parser: replacing it with any other
 string wouldn't change anything.
@@ -20,6 +20,7 @@ string wouldn't change anything.
 IMPORTANT: Named(8) evaluates externally-decided policies synchronously
 (even name lookups will be blocked). Therefore we must be as quick as possible.
 """
+
 import argparse
 import json
 import logging
@@ -31,6 +32,8 @@ from pathlib import Path
 
 import dns.resolver
 import dns.reversename
+
+logger = logging.getLogger(__name__)
 
 
 def unpack_req_msg(data):
@@ -65,10 +68,10 @@ def is_valid_acme_update(msg, signer, resolver, static_maps):
     # 'rr_name': '_acme-challenge.dtn-2.icecube.wisc.edu', 'rr_type': 'TXT'}
     subdomain, domain = msg["rr_name"].split(".", 1)
     if subdomain != "_acme-challenge" or msg["rr_type"] != "TXT":
-        logging.info(f"{msg} doesn't look related to an ACME challenge.")
+        logger.info(f"{msg} doesn't look related to an ACME challenge.")
         return False
     if msg["signer"] != signer:
-        logging.info(f"Request {msg} wasn't signed by {signer}/")
+        logger.info(f"Request {msg} wasn't signed by {signer}/")
         return False
 
     if domain in static_maps.get(msg["src_addr"], []):
@@ -82,18 +85,22 @@ def is_valid_acme_update(msg, signer, resolver, static_maps):
     try:
         domain_addrs = [str(a) for a in resolver.query(domain, "A")]
     except dns.resolver.NoAnswer:
-        logging.error(f"Failed to resolve {domain}.")
+        logger.error(f"Failed to resolve {domain}.")
         return False
     try:
-        rev_name = dns.reversename.from_address(msg["src_addr"])  # e.g. 8.8.8.8.in-addr.arpa
+        rev_name = dns.reversename.from_address(
+            msg["src_addr"]
+        )  # e.g. 8.8.8.8.in-addr.arpa
         src_ptr_names = [str(a) for a in dns.resolver.query(rev_name, "PTR")]
     except dns.resolver.NoAnswer:
-        logging.warning(f"Reserve DNS lookup failed for {msg['src_addr']}.")
+        logger.warning(f"Reserve DNS lookup failed for {msg['src_addr']}.")
         src_ptr_names = []
-    if msg["src_addr"] not in domain_addrs and domain + '.' not in src_ptr_names:
-        logging.info(f"Request {msg} failed to pass source security check:"
-                     f" {domain} doesn't resolve to {msg['src_addr']}"
-                     f" and {msg['src_addr']} doesn't resolve to {domain}")
+    if msg["src_addr"] not in domain_addrs and domain + "." not in src_ptr_names:
+        logger.info(
+            f"Request {msg} failed to pass source security check:"
+            f" {domain} doesn't resolve to {msg['src_addr']}"
+            f" and {msg['src_addr']} doesn't resolve to {domain}"
+        )
         return False
     return True
 
@@ -120,7 +127,7 @@ def main():
         "(D) Sometimes you need to pre-stage certificates on a machine that "
         "doesn't meet the default IP-to-FQDN mapping requirements for security. "
         "In these cases you can provide a static mapping of who can request which "
-        'domain using a JSON file. The format is {"ip1": ["fqdn1", "fqdn2"], ...}. ' 
+        'domain using a JSON file. The format is {"ip1": ["fqdn1", "fqdn2"], ...}. '
         "[1] https://bind9.readthedocs.io/en/latest/reference.html#namedconf-statement-update-policy",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
@@ -176,7 +183,7 @@ def main():
     resolver.lifetime = 0.5  # seconds to spend trying to get an answer
     try:
         resolver.query("google.com", "A")
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 -- any failure here should abort startup
         parser.exit(1, f"--dns servers failed test: {e}\n")
 
     if args.static_maps:
@@ -197,27 +204,30 @@ def main():
     server.listen()
 
     while True:
-        conn, addr = server.accept()
+        conn, _addr = server.accept()
         data = conn.recv(2**20)
-        logging.info(f"Received request {data}")
+        logger.info(f"Received request {data}")
         try:
             msg = unpack_req_msg(data)
-        except Exception as e:
-            logging.error(f"Denying request {data} because of decoding failure {e}")
+        # Any decoding failure must deny the request, not crash the daemon,
+        # since named(8) evaluates us synchronously for every DNS update.
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"Denying request {data} because of decoding failure {e}")
             conn.send(struct.pack("!I", 0))
             continue
         else:
-            logging.info(f"Unpacked request {msg}")
+            logger.info(f"Unpacked request {msg}")
             try:
                 grant = is_valid_acme_update(msg, args.signer, resolver, static_maps)
-            except Exception as e:
-                logging.error(f"Validating {msg} resulted an exception: {e}")
+            # Same fail-safe reasoning as above: never let validation crash the daemon.
+            except Exception as e:  # noqa: BLE001
+                logger.error(f"Validating {msg} resulted an exception: {e}")
                 grant = False
             if grant:
-                logging.info(f"Granting request {msg}")
+                logger.info(f"Granting request {msg}")
                 conn.send(struct.pack("!I", 1))
             else:
-                logging.info(f"Denying request {msg}")
+                logger.info(f"Denying request {msg}")
                 conn.send(struct.pack("!I", 0))
         finally:
             conn.close()
