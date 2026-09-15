@@ -231,6 +231,9 @@ def main():
     resolver.nameservers = args.dns
     resolver.timeout = 0.25  # seconds to wait for a response from a server
     resolver.lifetime = 0.5  # seconds to spend trying to get an answer
+    # Every lookup in this file uses the deprecated query() rather than
+    # resolve(), which exists only from dnspython 2.0, so that the daemon keeps
+    # working against the 1.x that long-lived distributions still ship.
     try:
         resolver.query("google.com", "A")
     except Exception as e:  # noqa: BLE001 -- any failure here should abort startup
