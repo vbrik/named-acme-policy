@@ -5,6 +5,7 @@ it is loaded via `importlib` from `conftest.py`-free fixtures below instead.
 """
 
 import importlib.util
+import re
 from pathlib import Path
 
 import dns.resolver
@@ -344,3 +345,66 @@ class TestIsValidAcmeUpdate:
         resolver = FakeResolver(a_records=["203.0.113.5"])
         with pytest.raises(Exception):  # noqa: B017 -- dnspython's own error type
             nap.is_valid_acme_update(msg, {"certbot": {}}, resolver)
+
+
+def _capture_exiting_output(argv, capsys):
+    """Run the parser on argv, expecting it to print and exit; return (stdout, code)."""
+    with pytest.raises(SystemExit) as exc_info:
+        nap.build_parser().parse_args(argv)
+    return capsys.readouterr().out, exc_info.value.code
+
+
+class TestDetailedHelp:
+    def test_works_without_the_required_socket_argument(self, capsys):
+        # The action must fire during parsing, like -h does; a check after
+        # parse_args() would be unreachable because --socket is required.
+        out, code = _capture_exiting_output(["--detailed-help"], capsys)
+        assert code in (0, None)
+        assert out.strip()
+
+    def test_socket_is_still_required_otherwise(self, capsys):
+        _, code = _capture_exiting_output([], capsys)
+        assert code != 0
+
+    def test_lines_stay_under_100_characters(self):
+        too_long = [ln for ln in nap.DETAILED_HELP.splitlines() if len(ln) >= 100]
+        assert not too_long
+
+    def test_is_broken_into_blank_line_separated_paragraphs(self):
+        assert "\n\n" in nap.DETAILED_HELP
+
+    def test_covers_each_section_the_epilog_used_to_carry(self):
+        for heading in (
+            "NAMED(8) INTEGRATION",
+            "WHY A SEPARATE DNS SERVER",
+            "SECURITY MODEL",
+            "SIGNER MAPS FILE",
+        ):
+            assert heading in nap.DETAILED_HELP
+
+    def test_bind9_url_is_not_split_across_lines(self):
+        # argparse's HelpFormatter used to hyphenate this URL mid-path.
+        url = "https://bind9.readthedocs.io/en/latest/reference.html#namedconf-statement-update-policy"
+        assert any(ln.strip() == url for ln in nap.DETAILED_HELP.splitlines())
+
+
+class TestHelpOutput:
+    def test_has_no_dangling_references_to_the_removed_epilog(self, capsys):
+        out, _ = _capture_exiting_output(["--help"], capsys)
+        assert "epilog" not in out.lower()
+        assert not re.search(r"note \(?[A-D]\)?", out, re.IGNORECASE)
+
+    def test_does_not_advertise_empty_defaults(self, capsys):
+        out, _ = _capture_exiting_output(["--help"], capsys)
+        assert "default: None" not in out
+
+    def test_points_at_detailed_help(self, capsys):
+        out, _ = _capture_exiting_output(["--help"], capsys)
+        assert "--detailed-help" in out
+
+    def test_dns_help_states_the_real_default(self, capsys):
+        # The default is spelled out by hand now that
+        # ArgumentDefaultsHelpFormatter is gone; guard against it drifting.
+        default = nap.build_parser().parse_args(["--socket", "/nonexistent"]).dns
+        out, _ = _capture_exiting_output(["--help"], capsys)
+        assert f"default: {' '.join(default)}" in " ".join(out.split())

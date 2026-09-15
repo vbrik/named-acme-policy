@@ -1,24 +1,9 @@
 #!/usr/bin/env python3
-"""
-This is an external named(8) update-policy decider daemon that allows dynamic
-DNS update requests if they are part of an Automatic Certificate Management
-Environment (ACME) DNS-01 challenge, for example, as used by Let's Encrypt's
-certbot client. This daemon implements a *somewhat* more secure permissions
-model than the bult-in named(8) mechanisms allow.
+"""External update-policy decider daemon for named(8): grants dynamic DNS
+updates that belong to an ACME DNS-01 challenge, such as certbot's.
 
-For instructions on how to integrate this daemon with named(8) see
-https://bind9.readthedocs.io/en/latest/reference.html#namedconf-statement-update-policy
-Basically this comes down to having something like the following in a zone
-configuration file:
-    ...
-    update-policy {
-        grant "local:/path/to/socket" external *;
-    ...
-(the '*' is there just to satisfy the config parser: replacing it with any other
-string wouldn't change anything.
-
-IMPORTANT: Named(8) evaluates externally-decided policies synchronously
-(even name lookups will be blocked). Therefore we must be as quick as possible.
+DETAILED_HELP below is the user-facing documentation (named(8) setup, security
+model). Keep operator-facing explanation there rather than duplicating it here.
 """
 
 import argparse
@@ -35,21 +20,78 @@ import dns.reversename
 
 logger = logging.getLogger(__name__)
 
+DETAILED_HELP = """\
+named-acme-policy -- external update-policy decider for ACME DNS-01 challenges
+
+
+NAMED(8) INTEGRATION
+
+  A zone is delegated to this daemon with an "external" update-policy rule naming
+  the daemon's socket. For the rule syntax, see the BIND 9 reference manual:
+
+  https://bind9.readthedocs.io/en/latest/reference.html#namedconf-statement-update-policy
+
+
+WHY A SEPARATE DNS SERVER
+
+  named(8) evaluates an external update-policy decision synchronously: it blocks
+  until this daemon answers, and that includes blocking the name lookups this
+  daemon makes to reach a decision. Pointing --dns at the local named(8) therefore
+  deadlocks. It must name a different resolver.
+
+
+SECURITY MODEL
+
+  A request is granted only when all of the following hold:
+
+    * the resource record name starts with "_acme-challenge." and its type is TXT;
+
+    * the request is signed by a signer present in --signer-maps (a request from
+      an unlisted signer is always denied);
+
+    * the source address is tied to the domain being updated, in any one of three
+      ways:
+
+        - --signer-maps maps the source address to that domain, or to "*";
+
+        - the domain resolves to the source address, which covers one-to-one and
+          round-robin hosts;
+
+        - the source address reverse-resolves to the domain, which covers
+          multi-homed hosts that send from an internal address while the domain
+          publishes an external one.
+
+
+SIGNER MAPS FILE
+
+  --signer-maps takes a JSON file of per-signer static address-to-domain overrides:
+
+      {"<signer>": {"<ip>": ["<fqdn>", ...]}}
+
+  An address may map to the literal "*" rather than a list, which grants that
+  signer any domain from that address. Such an entry confers blanket
+  _acme-challenge write access in every zone whose update-policy points at this
+  daemon's socket, so keep it out of zones it has no business in.
+
+  Without --signer-maps the sole accepted signer is "certbot" with no static
+  overrides, meaning every request must pass the address checks above.\
+"""
+
 
 def unpack_req_msg(data):
-    """Convert a dynamic DNS request message into a dictionary.
+    r"""Convert a named(8) update request message into the fields we judge on.
 
-    For the request message format, see the "external" rule type documentation:
+    The wire format is documented under the "external" update-policy rule type:
     https://bind9.readthedocs.io/en/latest/reference.html#namedconf-statement-update-policy
-    Request packets look like this:
-    (b'\x00\x00\x00\x01\x00\x00\x00bcertbot\x00_acme-challenge.bookstack.i'
-      b'cecube.wisc.edu\x00144.92.100.35\x00TXT\x00certbot/165/7089\x00\x00'
-      b'\x00\x00\x00'),
-    which unpacks to:
-    (1, 98, 'certbot', '_acme-challenge.bookstack.icecube.wisc.edu',
-      '144.92.100.35', 'TXT', 'certbot/165/7089', 0, '')
+    An 8-byte header precedes NUL-terminated fields; the first four interest us
+    (rr stands for resource record):
+
+        b'\x00\x00\x00\x01\x00\x00\x00bcertbot\x00_acme-challenge.bookstack.i'
+        b'cecube.wisc.edu\x00144.92.100.35\x00TXT\x00certbot/165/7089\x00\x00\x00\x00\x00'
+
+    -> signer 'certbot', rr_name '_acme-challenge.bookstack.icecube.wisc.edu',
+       src_addr '144.92.100.35', rr_type 'TXT'
     """
-    # rr stands for resource record
     signer, rr_name, src_addr, rr_type = data[8:].split(b"\x00")[0:4]
     return {
         "signer": signer.decode(),
@@ -60,12 +102,9 @@ def unpack_req_msg(data):
 
 
 def is_valid_acme_update(msg, signers, resolver):
-    """Check if the message appears to be a valid ACME DNS-01 request,
-    and passes some minimal security checks.
+    """Decide whether `msg`, as returned by `unpack_req_msg`, is an ACME DNS-01
+    update this daemon should grant. DETAILED_HELP states the rules.
     """
-    # Example msg (rr stands for resource record):
-    # {'signer': 'certbot', 'src_addr': '10.128.11.214',
-    # 'rr_name': '_acme-challenge.dtn-2.icecube.wisc.edu', 'rr_type': 'TXT'}
     subdomain, domain = msg["rr_name"].split(".", 1)
     if subdomain != "_acme-challenge" or msg["rr_type"] != "TXT":
         logger.info(f"{msg} doesn't look related to an ACME challenge.")
@@ -80,11 +119,10 @@ def is_valid_acme_update(msg, signers, resolver):
         logger.info(f"Granting {msg} via static map for signer {msg['signer']!r}.")
         return True
 
-    # Require that either (1) the request's source IP address is among the addresses
-    # the request's domain resolves to (this takes care of 1-to-1 and round-robin cases),
-    # OR (2) the reverse name of the request's source address resolves to the request's
-    # domain (this is for multi-homed cases, where the request comes from an internal
-    # address but the domain resolves to the external address).
+    # No static override, so make the requestor prove it owns the domain: either
+    # the domain resolves to the source address (1-to-1 and round-robin hosts), or
+    # the source address reverse-resolves to the domain (multi-homed hosts, which
+    # send from an internal address while the domain publishes an external one).
     try:
         domain_addrs = [str(a) for a in resolver.query(domain, "A")]
     except dns.resolver.NoAnswer:
@@ -96,7 +134,7 @@ def is_valid_acme_update(msg, signers, resolver):
         )  # e.g. 8.8.8.8.in-addr.arpa
         src_ptr_names = [str(a) for a in resolver.query(rev_name, "PTR")]
     except dns.resolver.NoAnswer:
-        logger.warning(f"Reserve DNS lookup failed for {msg['src_addr']}.")
+        logger.warning(f"Reverse DNS lookup failed for {msg['src_addr']}.")
         src_ptr_names = []
     if msg["src_addr"] not in domain_addrs and domain + "." not in src_ptr_names:
         logger.info(
@@ -111,31 +149,32 @@ def is_valid_acme_update(msg, signers, resolver):
     return True
 
 
-def main():
+class _DetailedHelpAction(argparse.Action):
+    """Print DETAILED_HELP and exit, mirroring how argparse implements -h.
+
+    Acting during parsing rather than after it is what lets --detailed-help be
+    used on its own, despite --socket being required. Printing directly also
+    keeps the text away from argparse's HelpFormatter, which would collapse the
+    paragraphs into one block.
+    """
+
+    def __init__(self, option_strings, dest, **kwargs):
+        super().__init__(option_strings, dest, nargs=0, **kwargs)
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        print(DETAILED_HELP)
+        parser.exit()
+
+
+def build_parser():
+    """Build the command-line parser, kept out of `main` so tests can reach it."""
     parser = argparse.ArgumentParser(
-        description="This is an external named(8) update-policy decider "
-        "daemon that allows dynamic DNS update requests if they are part "
-        "of an Automatic Certificate Management Environment (ACME) DNS-01 "
-        "challenge, for example as used by Let's Encrypt's certbot client. "
-        "This daemon implements a *somewhat* more secure permissions model "
-        "than the bult-in named(8) mechanisms allow: see notes (C) and (D) "
-        "in the epilog.",
-        epilog="Notes: (A) For instructions on how to integrate this daemon "
-        "with named(8) see [1]. (B) Because externally-decided update-policy "
-        "statements are executed synchronously, for request origin security "
-        "check, this script needs to use a DNS server other than the one it's "
-        "running on (to avoid deadlock). "
-        "(C) See code for the exact security requirements, but basically it comes "
-        "down to the IP address of the requestor bein associated "
-        "with the domain being requested: requestor address is among addresses the "
-        "domain resolves to, or requestor IP reverse-maps to the requested domain, "
-        "(also, see note (D)). "
-        "(D) --signer-maps is a JSON file of per-signer static IP-to-domain "
-        'overrides: {"signer": {"ip": ["fqdn", ...]}}. An unlisted signer is '
-        'denied. An IP\'s value can instead be the literal "*" to grant that signer '
-        "any domain from that IP. "
-        "[1] https://bind9.readthedocs.io/en/latest/reference.html#namedconf-statement-update-policy",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        description="External named(8) update-policy decider daemon that grants "
+        "dynamic DNS (RFC 2136) update requests belonging to an Automatic "
+        "Certificate Management Environment (ACME) DNS-01 challenge, such as those "
+        "made by Let's Encrypt's certbot client. It enforces a somewhat stricter "
+        "permissions model than named(8)'s built-in update-policy rules allow; run "
+        "with --detailed-help for that model and for setup notes.",
     )
     parser.add_argument(
         "--socket",
@@ -152,16 +191,29 @@ def main():
         "--dns",
         metavar="IP",
         nargs="+",
-        default=["8.8.8.8", "4.4.4.4"],
-        help="different nameserver for address verification; see note (B)",
+        default=["8.8.8.8", "8.8.4.4"],
+        help="resolver(s) used to verify request source addresses; must not be "
+        "the named(8) this daemon serves, which would deadlock "
+        "(default: 8.8.8.8 8.8.4.4)",
     )
     parser.add_argument(
         "--signer-maps",
         metavar="PATH",
-        help="JSON file of per-signer static IP-FQDN overrides, see note (D) "
-        '(default: %(default)s, i.e. only signer "certbot" is accepted, '
-        "with no overrides)",
+        help="JSON file of per-signer static IP-to-domain overrides; a signer it "
+        'omits is denied outright (default: accept signer "certbot" only, with no '
+        "overrides)",
     )
+    parser.add_argument(
+        "--detailed-help",
+        action=_DetailedHelpAction,
+        default=argparse.SUPPRESS,
+        help="show the security model and named(8) setup notes, and exit",
+    )
+    return parser
+
+
+def main():
+    parser = build_parser()
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -172,13 +224,9 @@ def main():
     if args.log_file:
         logging.getLogger().addHandler(logging.StreamHandler())
 
-    # External update-policy decision protocol is this:
-    #   1. Named(8) writes a dynamic DNS update request message to the socket.
-    #   2. The external decider process writes 1 or 0 to the socket.
-    #   3. Named(8) reads the socket and grants or denies the request.
-    # Named(8) evaluates externally-decided policies synchronously (even name
-    # lookups will be blocked). Therefore, we must be as quick as possible.
-
+    # The protocol: named(8) writes a request to the socket, we write back 1 or 0.
+    # It blocks on that answer, including on the lookups below, so these timeouts
+    # are a latency budget for the whole server rather than mere error handling.
     resolver = dns.resolver.Resolver(configure=False)
     resolver.nameservers = args.dns
     resolver.timeout = 0.25  # seconds to wait for a response from a server
@@ -223,7 +271,7 @@ def main():
                 grant = is_valid_acme_update(msg, signers, resolver)
             # Same fail-safe reasoning as above: never let validation crash the daemon.
             except Exception as e:  # noqa: BLE001
-                logger.error(f"Validating {msg} resulted an exception: {e}")
+                logger.error(f"Validating {msg} raised an exception: {e}")
                 grant = False
             if grant:
                 logger.info(f"Granting request {msg}")

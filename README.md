@@ -10,6 +10,9 @@ This daemon implements a *somewhat* more secure permissions model than the built
 named(8) mechanisms allow for automated certificate issuance using DNS-01 challenge
 via RFC 2136.
 
+Run `named-acme-policy.py --help` for the available options, or
+`--detailed-help` for the security model and named(8) setup notes.
+
 The daemon allows dynamic DNS updates if they meet the following criteria:
 * Name of the DNS resource record being updated starts with `_acme-challenge.`.
 * The update request has been signed by a TSIG key/identity configured via `--signer-maps`.
