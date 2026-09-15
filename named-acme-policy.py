@@ -21,8 +21,6 @@ IMPORTANT: Named(8) evaluates externally-decided policies synchronously
 (even name lookups will be blocked). Therefore we must be as quick as possible.
 """
 import argparse
-import dns.resolver
-import dns.reversename
 import json
 import logging
 import shutil
@@ -30,6 +28,9 @@ import socket
 import struct
 import sys
 from pathlib import Path
+
+import dns.resolver
+import dns.reversename
 
 
 def unpack_req_msg(data):
