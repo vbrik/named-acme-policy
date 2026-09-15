@@ -6,7 +6,6 @@ it is loaded via `importlib` from `conftest.py`-free fixtures below instead.
 
 import importlib.util
 from pathlib import Path
-from types import SimpleNamespace
 
 import dns.resolver
 import pytest
@@ -78,130 +77,119 @@ class TestUnpackReqMsg:
             nap.unpack_req_msg(data)
 
 
-class TestIsValidAcmeUpdate:
-    """Tests for is_valid_acme_update.
+class FakeResolver:
+    """Stubs the `resolver` argument for both the A and PTR lookups.
 
-    The function's PTR lookup calls the *module-level* dns.resolver.query
-    (not the `resolver` argument passed in), so both the injected resolver
-    and dns.resolver.query must be stubbed independently. See note (B) in
-    the script's --help epilog for why the injected resolver exists at all;
-    this asymmetry is a known design inconsistency, not something these
-    tests should paper over.
+    is_valid_acme_update uses this same injected resolver for both queries
+    (see note (B) in the script's --help epilog: a non-local resolver is
+    required to avoid deadlock, since named(8) evaluates this synchronously
+    against itself), so a single stub tracking both is enough.
     """
 
-    @staticmethod
-    def make_resolver(a_records=(), raise_on_a=None):
-        def query(_name, _rdtype):
-            if raise_on_a is not None:
-                raise raise_on_a
-            return list(a_records)
+    def __init__(
+        self, a_records=(), ptr_records=(), raise_on_a=None, raise_on_ptr=None
+    ):
+        self.a_records = list(a_records)
+        self.ptr_records = list(ptr_records)
+        self.raise_on_a = raise_on_a
+        self.raise_on_ptr = raise_on_ptr
+        self.calls = []
 
-        return SimpleNamespace(query=query)
+    def query(self, name, rdtype):
+        self.calls.append((name, rdtype))
+        if rdtype == "A":
+            if self.raise_on_a is not None:
+                raise self.raise_on_a
+            return self.a_records
+        if rdtype == "PTR":
+            if self.raise_on_ptr is not None:
+                raise self.raise_on_ptr
+            return self.ptr_records
+        raise AssertionError(f"unexpected rdtype {rdtype!r}")
 
-    @staticmethod
-    def patch_ptr(monkeypatch, ptr_records=(), raise_on_ptr=None):
-        def query(_name, _rdtype):
-            if raise_on_ptr is not None:
-                raise raise_on_ptr
-            return list(ptr_records)
 
-        monkeypatch.setattr(dns.resolver, "query", query)
-
-    def test_wrong_subdomain_denied_without_dns_lookup(self, monkeypatch):
-        calls = []
-        monkeypatch.setattr(dns.resolver, "query", lambda *a: calls.append(a) or [])
+class TestIsValidAcmeUpdate:
+    def test_wrong_subdomain_denied_without_dns_lookup(self):
         msg = {
             "signer": "certbot",
             "rr_name": "not-acme.example.com",
             "src_addr": "10.0.0.1",
             "rr_type": "TXT",
         }
-        resolver = self.make_resolver()
+        resolver = FakeResolver()
         assert nap.is_valid_acme_update(msg, "certbot", resolver, {}) is False
-        assert calls == []
+        assert resolver.calls == []
 
-    def test_wrong_rr_type_denied_without_dns_lookup(self, monkeypatch):
-        calls = []
-        monkeypatch.setattr(dns.resolver, "query", lambda *a: calls.append(a) or [])
+    def test_wrong_rr_type_denied_without_dns_lookup(self):
         msg = {
             "signer": "certbot",
             "rr_name": "_acme-challenge.example.com",
             "src_addr": "10.0.0.1",
             "rr_type": "A",
         }
-        resolver = self.make_resolver()
+        resolver = FakeResolver()
         assert nap.is_valid_acme_update(msg, "certbot", resolver, {}) is False
-        assert calls == []
+        assert resolver.calls == []
 
-    def test_wrong_signer_denied_without_dns_lookup(self, monkeypatch):
-        calls = []
-        monkeypatch.setattr(dns.resolver, "query", lambda *a: calls.append(a) or [])
+    def test_wrong_signer_denied_without_dns_lookup(self):
         msg = {
             "signer": "someone-else",
             "rr_name": "_acme-challenge.example.com",
             "src_addr": "10.0.0.1",
             "rr_type": "TXT",
         }
-        resolver = self.make_resolver()
+        resolver = FakeResolver()
         assert nap.is_valid_acme_update(msg, "certbot", resolver, {}) is False
-        assert calls == []
+        assert resolver.calls == []
 
-    def test_wrong_signer_denied_even_with_static_map_hit(self, monkeypatch):
+    def test_wrong_signer_denied_even_with_static_map_hit(self):
         # Signer check must precede the static-map shortcut: a static mapping
         # authorizes a source IP for a domain, but only once signed correctly.
-        calls = []
-        monkeypatch.setattr(dns.resolver, "query", lambda *a: calls.append(a) or [])
         msg = {
             "signer": "someone-else",
             "rr_name": "_acme-challenge.example.com",
             "src_addr": "10.0.0.1",
             "rr_type": "TXT",
         }
-        resolver = self.make_resolver()
+        resolver = FakeResolver()
         static_maps = {"10.0.0.1": ["example.com"]}
         assert nap.is_valid_acme_update(msg, "certbot", resolver, static_maps) is False
-        assert calls == []
+        assert resolver.calls == []
 
-    def test_static_map_hit_grants_without_dns_lookup(self, monkeypatch):
-        calls = []
-        monkeypatch.setattr(dns.resolver, "query", lambda *a: calls.append(a) or [])
+    def test_static_map_hit_grants_without_dns_lookup(self):
         msg = {
             "signer": "certbot",
             "rr_name": "_acme-challenge.example.com",
             "src_addr": "10.0.0.1",
             "rr_type": "TXT",
         }
-        resolver = self.make_resolver()
+        resolver = FakeResolver()
         static_maps = {"10.0.0.1": ["other.example.org", "example.com"]}
         assert nap.is_valid_acme_update(msg, "certbot", resolver, static_maps) is True
-        assert calls == []
+        assert resolver.calls == []
 
-    def test_static_map_present_but_no_matching_domain_falls_through_to_dns(
-        self, monkeypatch
-    ):
+    def test_static_map_present_but_no_matching_domain_falls_through_to_dns(self):
         msg = {
             "signer": "certbot",
             "rr_name": "_acme-challenge.example.com",
             "src_addr": "10.0.0.1",
             "rr_type": "TXT",
         }
-        resolver = self.make_resolver(a_records=["10.0.0.1"])
-        self.patch_ptr(monkeypatch)
+        resolver = FakeResolver(a_records=["10.0.0.1"])
         static_maps = {"10.0.0.1": ["unrelated.example.org"]}
         assert nap.is_valid_acme_update(msg, "certbot", resolver, static_maps) is True
 
-    def test_forward_resolution_match_grants(self, monkeypatch):
+    def test_forward_resolution_match_grants(self):
         msg = {
             "signer": "certbot",
             "rr_name": "_acme-challenge.example.com",
             "src_addr": "10.0.0.1",
             "rr_type": "TXT",
         }
-        resolver = self.make_resolver(a_records=["10.0.0.1", "10.0.0.2"])
-        self.patch_ptr(monkeypatch, ptr_records=[])
+        resolver = FakeResolver(a_records=["10.0.0.1", "10.0.0.2"])
         assert nap.is_valid_acme_update(msg, "certbot", resolver, {}) is True
 
-    def test_reverse_resolution_match_grants_multihomed_case(self, monkeypatch):
+    def test_reverse_resolution_match_grants_multihomed_case(self):
         msg = {
             "signer": "certbot",
             "rr_name": "_acme-challenge.example.com",
@@ -210,31 +198,36 @@ class TestIsValidAcmeUpdate:
         }
         # Forward lookup returns only the public address; source is an
         # internal address whose PTR record points back to the domain.
-        resolver = self.make_resolver(a_records=["203.0.113.5"])
-        self.patch_ptr(monkeypatch, ptr_records=["example.com."])
+        resolver = FakeResolver(a_records=["203.0.113.5"], ptr_records=["example.com."])
         assert nap.is_valid_acme_update(msg, "certbot", resolver, {}) is True
+        # The PTR lookup must go through the injected resolver, not the
+        # module-level dns.resolver.query, per note (B) in the --help epilog.
+        assert [(str(name), rdtype) for name, rdtype in resolver.calls] == [
+            ("example.com", "A"),
+            ("1.1.168.192.in-addr.arpa.", "PTR"),
+        ]
 
-    def test_ptr_record_without_trailing_dot_does_not_match(self, monkeypatch):
+    def test_ptr_record_without_trailing_dot_does_not_match(self):
         msg = {
             "signer": "certbot",
             "rr_name": "_acme-challenge.example.com",
             "src_addr": "192.168.1.1",
             "rr_type": "TXT",
         }
-        resolver = self.make_resolver(a_records=["203.0.113.5"])
         # Missing the trailing dot that a real PTR RRset would have.
-        self.patch_ptr(monkeypatch, ptr_records=["example.com"])
+        resolver = FakeResolver(a_records=["203.0.113.5"], ptr_records=["example.com"])
         assert nap.is_valid_acme_update(msg, "certbot", resolver, {}) is False
 
-    def test_neither_forward_nor_reverse_match_denies(self, monkeypatch):
+    def test_neither_forward_nor_reverse_match_denies(self):
         msg = {
             "signer": "certbot",
             "rr_name": "_acme-challenge.example.com",
             "src_addr": "192.168.1.1",
             "rr_type": "TXT",
         }
-        resolver = self.make_resolver(a_records=["203.0.113.5"])
-        self.patch_ptr(monkeypatch, ptr_records=["other-domain.com."])
+        resolver = FakeResolver(
+            a_records=["203.0.113.5"], ptr_records=["other-domain.com."]
+        )
         assert nap.is_valid_acme_update(msg, "certbot", resolver, {}) is False
 
     def test_forward_resolution_no_answer_denies(self):
@@ -244,7 +237,7 @@ class TestIsValidAcmeUpdate:
             "src_addr": "10.0.0.1",
             "rr_type": "TXT",
         }
-        resolver = self.make_resolver(raise_on_a=dns.resolver.NoAnswer())
+        resolver = FakeResolver(raise_on_a=dns.resolver.NoAnswer())
         assert nap.is_valid_acme_update(msg, "certbot", resolver, {}) is False
 
     def test_forward_resolution_nxdomain_propagates(self):
@@ -257,32 +250,32 @@ class TestIsValidAcmeUpdate:
             "src_addr": "10.0.0.1",
             "rr_type": "TXT",
         }
-        resolver = self.make_resolver(raise_on_a=dns.resolver.NXDOMAIN())
+        resolver = FakeResolver(raise_on_a=dns.resolver.NXDOMAIN())
         with pytest.raises(dns.resolver.NXDOMAIN):
             nap.is_valid_acme_update(msg, "certbot", resolver, {})
 
-    def test_ptr_lookup_no_answer_treated_as_empty_and_falls_back_to_forward(
-        self, monkeypatch
-    ):
+    def test_ptr_lookup_no_answer_treated_as_empty_and_falls_back_to_forward(self):
         msg = {
             "signer": "certbot",
             "rr_name": "_acme-challenge.example.com",
             "src_addr": "10.0.0.1",
             "rr_type": "TXT",
         }
-        resolver = self.make_resolver(a_records=["10.0.0.1"])
-        self.patch_ptr(monkeypatch, raise_on_ptr=dns.resolver.NoAnswer())
+        resolver = FakeResolver(
+            a_records=["10.0.0.1"], raise_on_ptr=dns.resolver.NoAnswer()
+        )
         assert nap.is_valid_acme_update(msg, "certbot", resolver, {}) is True
 
-    def test_ptr_lookup_no_answer_and_no_forward_match_denies(self, monkeypatch):
+    def test_ptr_lookup_no_answer_and_no_forward_match_denies(self):
         msg = {
             "signer": "certbot",
             "rr_name": "_acme-challenge.example.com",
             "src_addr": "10.0.0.1",
             "rr_type": "TXT",
         }
-        resolver = self.make_resolver(a_records=["203.0.113.5"])
-        self.patch_ptr(monkeypatch, raise_on_ptr=dns.resolver.NoAnswer())
+        resolver = FakeResolver(
+            a_records=["203.0.113.5"], raise_on_ptr=dns.resolver.NoAnswer()
+        )
         assert nap.is_valid_acme_update(msg, "certbot", resolver, {}) is False
 
     def test_malformed_rr_name_without_dot_raises(self):
@@ -294,7 +287,7 @@ class TestIsValidAcmeUpdate:
             "src_addr": "10.0.0.1",
             "rr_type": "TXT",
         }
-        resolver = self.make_resolver()
+        resolver = FakeResolver()
         with pytest.raises(ValueError):
             nap.is_valid_acme_update(msg, "certbot", resolver, {})
 
@@ -308,6 +301,6 @@ class TestIsValidAcmeUpdate:
             "src_addr": "not-an-ip",
             "rr_type": "TXT",
         }
-        resolver = self.make_resolver(a_records=["203.0.113.5"])
+        resolver = FakeResolver(a_records=["203.0.113.5"])
         with pytest.raises(Exception):  # noqa: B017 -- dnspython's own error type
             nap.is_valid_acme_update(msg, "certbot", resolver, {})
