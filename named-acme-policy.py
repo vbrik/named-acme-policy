@@ -56,6 +56,11 @@ SECURITY MODEL
     * the request is signed by a signer present in --signer-maps (a request from
       an unlisted signer is always denied);
 
+    * the domain being updated (the part after "_acme-challenge.") exists, meaning
+      it has an A record, possibly via CNAME. This is checked before any of the
+      ways below, so it binds static maps too, "*" included. A lookup that fails
+      for any reason, resolver trouble included, denies the request;
+
     * the source address is tied to the domain being updated, in any one of three
       ways:
 
@@ -68,9 +73,6 @@ SECURITY MODEL
           multi-homed hosts that send from an internal address while the domain
           publishes an external one.
 
-      Both DNS checks need the domain to have an A record: if its forward lookup
-      fails, the request is denied without trying the reverse lookup.
-
 
 SIGNER MAPS FILE
 
@@ -79,7 +81,7 @@ SIGNER MAPS FILE
       {"<signer>": {"<ip>": ["<fqdn>", ...]}}
 
   An address may map to the literal "*" rather than a list, which grants that
-  signer any domain from that address. Such an entry confers blanket
+  signer any existing domain from that address. Such an entry confers blanket
   _acme-challenge write access in every zone whose update-policy points at this
   daemon's socket, so keep it out of zones it has no business in.
 
@@ -124,7 +126,23 @@ def is_valid_acme_update(msg, signers, resolver):
         logger.info(f"Request {msg} signed by unconfigured signer {msg['signer']!r}.")
         return False
 
-    allowed = maps.get(msg["src_addr"], [])
+    # The domain must exist, meaning it has an A record (possibly via CNAME),
+    # before any grant path is considered, static maps and "*" included. Failing
+    # to find out, e.g. because --dns is unreachable, denies as well. Lookup
+    # failures deny here, logged with what was being looked up, rather than
+    # propagating to main()'s generic exception handler.
+    # Absolute, because query() applies the search list to relative names, and
+    # even Resolver(configure=False) derives one from the host's FQDN: a missing
+    # foo.example.org would be retried as foo.example.org.<our domain>.
+    domain_name = dns.name.from_text(domain)
+    try:
+        domain_addrs = [str(a) for a in resolver.query(domain_name, "A")]
+    except dns.exception.DNSException as e:
+        _log_lookup_failure(f"Existence check (A lookup) of {domain}", e)
+        return False
+
+    src_addr = msg["src_addr"]
+    allowed = maps.get(src_addr, [])
     if allowed == "*" or (isinstance(allowed, list) and domain in allowed):
         logger.info(f"Granting {msg} via static map for signer {msg['signer']!r}.")
         return True
@@ -133,18 +151,6 @@ def is_valid_acme_update(msg, signers, resolver):
     # the domain resolves to the source address (1-to-1 and round-robin hosts), or
     # the source address reverse-resolves to the domain (multi-homed hosts, which
     # send from an internal address while the domain publishes an external one).
-    # Lookup failures deny here, logged with what was being looked up, rather
-    # than propagating to main()'s generic exception handler.
-    src_addr = msg["src_addr"]
-    # Absolute, because query() applies the search list to relative names, and
-    # even Resolver(configure=False) derives one from the host's FQDN: a missing
-    # foo.example.org would be retried as foo.example.org.<our domain>.
-    domain_name = dns.name.from_text(domain)
-    try:
-        domain_addrs = [str(a) for a in resolver.query(domain_name, "A")]
-    except dns.exception.DNSException as e:
-        _log_lookup_failure(f"Forward lookup of {domain}", e)
-        return False
     if src_addr in domain_addrs:
         logger.info(f"Granting {msg} via forward lookup for signer {msg['signer']!r}.")
         return True

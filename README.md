@@ -16,16 +16,20 @@ Run `named-acme-policy.py --help` for the available options, or
 The daemon allows dynamic DNS updates if they meet the following criteria:
 * Name of the DNS resource record being updated starts with `_acme-challenge.`.
 * The update request has been signed by a TSIG key/identity configured via `--signer-maps`.
+* The challenge's domain (the part after `_acme-challenge.`) exists, i.e. has an
+  A record (possibly via CNAME). This is checked before the conditions below,
+  so it applies to `--signer-maps` entries too, `*` included. If the lookup
+  fails for any reason, including an unreachable `--dns` resolver, the request
+  is denied.
 * At least one of the following holds:
-  * The challenge's domain (the part after `_acme-challenge.`) resolves to the
-    request's source address.
+  * The domain resolves to the request's source address.
   * The source address reverse-resolves to the domain. This covers multi-homed
     hosts that send from an internal address while the domain resolves to an
-    external one. It is tried only if the domain has an A record.
+    external one.
     * If private source addresses are involved, set `--dns` to a resolver that
       can reverse-resolve private IPs. The default public resolvers can't.
-  * The source address maps to the domain (or to `*`, meaning any domain) for
-    that signer in the `--signer-maps` file.
+  * The source address maps to the domain (or to `*`, meaning any existing
+    domain) for that signer in the `--signer-maps` file.
 
 `--signer-maps` is a JSON file of per-signer static IP-to-domain overrides, e.g.:
 ```json
@@ -35,8 +39,9 @@ The daemon allows dynamic DNS updates if they meet the following criteria:
 }
 ```
 Each IP maps to either a list of domains or the literal `"*"` (not a bare
-domain string), meaning any domain — useful for e.g. letting Kubernetes
-workers request certs for arbitrary ingress hostnames under a dedicated key.
+domain string), meaning any existing domain — useful for e.g. letting
+Kubernetes workers request certs for arbitrary ingress hostnames under a
+dedicated key.
 A `"*"` entry grants blanket `_acme-challenge` write access in every zone
 whose update-policy uses this daemon's socket, so keep it out of zones it
 shouldn't touch.

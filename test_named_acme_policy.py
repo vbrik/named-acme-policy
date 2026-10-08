@@ -113,7 +113,8 @@ class FakeResolver:
     (DETAILED_HELP's "WHY A SEPARATE DNS SERVER": a non-local resolver is
     required to avoid deadlock, since named(8) evaluates this synchronously
     against itself), so a single stub tracking both is enough. Records are
-    given as text and returned as real rdata, as dnspython would.
+    given as text and returned as real rdata, as dnspython would; also like
+    dnspython, an empty answer raises NoAnswer rather than returning [].
     """
 
     def __init__(
@@ -127,15 +128,18 @@ class FakeResolver:
 
     def query(self, name, rdtype):
         self.calls.append((name, rdtype))
-        if rdtype == "A":
-            if self.raise_on_a is not None:
-                raise self.raise_on_a
-            return [_rdata("A", a) for a in self.a_records]
-        if rdtype == "PTR":
-            if self.raise_on_ptr is not None:
-                raise self.raise_on_ptr
-            return [_rdata("PTR", p) for p in self.ptr_records]
-        raise AssertionError(f"unexpected rdtype {rdtype!r}")
+        match rdtype:
+            case "A":
+                exc, records = self.raise_on_a, self.a_records
+            case "PTR":
+                exc, records = self.raise_on_ptr, self.ptr_records
+            case _:
+                raise AssertionError(f"unexpected rdtype {rdtype!r}")
+        if exc is not None:
+            raise exc
+        if not records:
+            raise dns.resolver.NoAnswer()
+        return [_rdata(rdtype, r) for r in records]
 
 
 def _rdata(rdtype, text):
@@ -207,29 +211,68 @@ class TestIsValidAcmeUpdate:
         assert nap.is_valid_acme_update(msg, signers, resolver) is False
         assert resolver.calls == []
 
-    def test_static_map_hit_grants_without_dns_lookup(self):
+    def test_static_map_hit_grants_after_existence_check_only(self):
+        # The domain's A records needn't include the source address; the
+        # lookup only establishes that the domain exists.
         msg = {
             "signer": "certbot",
             "rr_name": "_acme-challenge.example.com",
             "src_addr": "10.0.0.1",
             "rr_type": "TXT",
         }
-        resolver = FakeResolver()
+        resolver = FakeResolver(a_records=["203.0.113.5"])
         signers = {"certbot": {"10.0.0.1": ["other.example.org", "example.com"]}}
         assert nap.is_valid_acme_update(msg, signers, resolver) is True
-        assert resolver.calls == []
+        assert [rdtype for _, rdtype in resolver.calls] == ["A"]
 
-    def test_wildcard_static_map_entry_grants_any_domain(self):
+    def test_wildcard_static_map_entry_grants_any_existing_domain(self):
         msg = {
             "signer": "k8s-certbot",
             "rr_name": "_acme-challenge.anything.example.net",
             "src_addr": "10.1.2.3",
             "rr_type": "TXT",
         }
-        resolver = FakeResolver()
+        resolver = FakeResolver(a_records=["203.0.113.5"])
         signers = {"k8s-certbot": {"10.1.2.3": "*"}}
         assert nap.is_valid_acme_update(msg, signers, resolver) is True
-        assert resolver.calls == []
+        assert [rdtype for _, rdtype in resolver.calls] == ["A"]
+
+    @pytest.mark.parametrize(
+        "allowed", ["*", ["example.com"]], ids=["wildcard", "listed"]
+    )
+    @pytest.mark.parametrize(("exc", "level"), DNS_FAILURES)
+    def test_static_map_hit_denied_unless_domain_exists(
+        self, allowed, exc, level, caplog
+    ):
+        # Existence is checked before the static map is consulted, and
+        # resolver trouble fails closed: existence can't be confirmed.
+        msg = {
+            "signer": "certbot",
+            "rr_name": "_acme-challenge.example.com",
+            "src_addr": "10.0.0.1",
+            "rr_type": "TXT",
+        }
+        resolver = FakeResolver(raise_on_a=exc)
+        signers = {"certbot": {"10.0.0.1": allowed}}
+        assert nap.is_valid_acme_update(msg, signers, resolver) is False
+        assert [rdtype for _, rdtype in resolver.calls] == ["A"]
+        (record,) = caplog.records
+        assert record.levelname == level
+        assert record.message.startswith(
+            f"Existence check (A lookup) of example.com failed: {type(exc).__name__}"
+        )
+
+    def test_domain_without_a_record_denied_even_by_wildcard(self):
+        # E.g. an AAAA-only name: the stub raises NoAnswer for an empty A set.
+        msg = {
+            "signer": "k8s-certbot",
+            "rr_name": "_acme-challenge.v6only.example.net",
+            "src_addr": "10.1.2.3",
+            "rr_type": "TXT",
+        }
+        resolver = FakeResolver()
+        signers = {"k8s-certbot": {"10.1.2.3": "*"}}
+        assert nap.is_valid_acme_update(msg, signers, resolver) is False
 
     def test_wildcard_entry_for_other_ip_does_not_grant_unlisted_ip(self):
         # A signer's wildcard grant is scoped to the specific IPs listed for
@@ -361,7 +404,7 @@ class TestIsValidAcmeUpdate:
         (record,) = caplog.records
         assert record.levelname == level
         assert record.message.startswith(
-            f"Forward lookup of example.com failed: {type(exc).__name__}"
+            f"Existence check (A lookup) of example.com failed: {type(exc).__name__}"
         )
 
     def test_forward_match_grants_without_ptr_lookup(self):
