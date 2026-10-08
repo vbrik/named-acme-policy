@@ -17,6 +17,7 @@ import sys
 from pathlib import Path
 
 import dns.exception
+import dns.name
 import dns.resolver
 import dns.reversename
 
@@ -67,8 +68,8 @@ SECURITY MODEL
           multi-homed hosts that send from an internal address while the domain
           publishes an external one.
 
-      Both DNS checks need the domain to resolve: if its forward lookup fails,
-      the request is denied without trying the reverse lookup.
+      Both DNS checks need the domain to have an A record: if its forward lookup
+      fails, the request is denied without trying the reverse lookup.
 
 
 SIGNER MAPS FILE
@@ -132,13 +133,17 @@ def is_valid_acme_update(msg, signers, resolver):
     # the domain resolves to the source address (1-to-1 and round-robin hosts), or
     # the source address reverse-resolves to the domain (multi-homed hosts, which
     # send from an internal address while the domain publishes an external one).
-    # Lookup failures deny here rather than propagating to main(), whose log
-    # would carry only dnspython's context-free message.
+    # Lookup failures deny here, logged with what was being looked up, rather
+    # than propagating to main()'s generic exception handler.
     src_addr = msg["src_addr"]
+    # Absolute, because query() applies the search list to relative names, and
+    # even Resolver(configure=False) derives one from the host's FQDN: a missing
+    # foo.example.org would be retried as foo.example.org.<our domain>.
+    domain_name = dns.name.from_text(domain)
     try:
-        domain_addrs = [str(a) for a in resolver.query(domain, "A")]
+        domain_addrs = [str(a) for a in resolver.query(domain_name, "A")]
     except dns.exception.DNSException as e:
-        logger.warning(f"Forward lookup of {domain} failed: {type(e).__name__}")
+        _log_lookup_failure(f"Forward lookup of {domain}", e)
         return False
     if src_addr in domain_addrs:
         logger.info(f"Granting {msg} via forward lookup for signer {msg['signer']!r}.")
@@ -148,24 +153,43 @@ def is_valid_acme_update(msg, signers, resolver):
     # failure deny a request the forward match already justifies.
     rev_name = dns.reversename.from_address(src_addr)  # e.g. 8.8.8.8.in-addr.arpa.
     try:
-        src_ptr_names = [str(n) for n in resolver.query(rev_name, "PTR")]
+        src_ptr_names = [ptr.target for ptr in resolver.query(rev_name, "PTR")]
     except dns.exception.DNSException as e:
-        # Public resolvers answer NXDOMAIN for private reverse zones.
+        # Public resolvers answer NXDOMAIN for non-global reverse zones.
         hint = ""
-        if (
-            isinstance(e, dns.resolver.NXDOMAIN)
-            and ipaddress.ip_address(src_addr).is_private
-        ):
-            hint = " (private address: does --dns serve its reverse zone?)"
-        logger.warning(f"Reverse lookup of {src_addr} failed: {type(e).__name__}{hint}")
+        if isinstance(e, dns.resolver.NXDOMAIN) and _is_non_global(src_addr):
+            hint = " (non-global address: does --dns serve its reverse zone?)"
+        _log_lookup_failure(f"Reverse lookup of {src_addr}", e, hint)
         return False
-    if domain + "." in src_ptr_names:
+    # Name comparison, unlike str comparison, ignores case as DNS does.
+    if domain_name in src_ptr_names:
         logger.info(f"Granting {msg} via reverse lookup for signer {msg['signer']!r}.")
         return True
     logger.info(
-        f"Source check failed: {domain} -> {domain_addrs}, {src_addr} -> {src_ptr_names}"
+        f"Source check failed: {domain} -> {domain_addrs},"
+        f" {src_addr} -> {[str(n) for n in src_ptr_names]}"
     )
     return False
+
+
+def _log_lookup_failure(what, exc, hint=""):
+    """Log a failed lookup. Resolver trouble (timeouts, every server failing) is
+    an ERROR with dnspython's message, which names each server and its answer;
+    a negative answer (NXDOMAIN, NoAnswer) is a WARNING that needs no detail.
+    """
+    if isinstance(exc, (dns.exception.Timeout, dns.resolver.NoNameservers)):
+        logger.error(f"{what} failed: {type(exc).__name__}: {exc}")
+    else:
+        logger.warning(f"{what} failed: {type(exc).__name__}{hint}")
+
+
+def _is_non_global(addr):
+    """Whether `addr` is an IP address outside globally routable space."""
+    try:
+        return not ipaddress.ip_address(addr).is_global
+    # dnspython 1.x accepts addresses ipaddress rejects, e.g. 010.0.0.1.
+    except ValueError:
+        return False
 
 
 class _DetailedHelpAction(argparse.Action):

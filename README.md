@@ -21,7 +21,7 @@ resolves to the IP address from which the update request originated,
 OR (2) the request's source address resolves to the domain name of the
 challenge (this is for multi-homed cases, where the request comes from an internal
 address but the domain resolves to the external address; it is tried only if the
-domain resolves at all),
+domain has an A record),
 OR (3) the request's source address maps to the requested domain (or to `*`,
 meaning any domain) for that signer in the `--signer-maps` file.
 

@@ -11,6 +11,9 @@ import re
 from pathlib import Path
 
 import dns.exception
+import dns.rdata
+import dns.rdataclass
+import dns.rdatatype
 import dns.resolver
 import pytest
 
@@ -109,10 +112,9 @@ class FakeResolver:
     is_valid_acme_update uses this same injected resolver for both queries
     (DETAILED_HELP's "WHY A SEPARATE DNS SERVER": a non-local resolver is
     required to avoid deadlock, since named(8) evaluates this synchronously
-    against itself), so a single stub tracking both is enough.
+    against itself), so a single stub tracking both is enough. Records are
+    given as text and returned as real rdata, as dnspython would.
     """
-
-    nameservers = ("192.0.2.53",)
 
     def __init__(
         self, a_records=(), ptr_records=(), raise_on_a=None, raise_on_ptr=None
@@ -128,19 +130,32 @@ class FakeResolver:
         if rdtype == "A":
             if self.raise_on_a is not None:
                 raise self.raise_on_a
-            return self.a_records
+            return [_rdata("A", a) for a in self.a_records]
         if rdtype == "PTR":
             if self.raise_on_ptr is not None:
                 raise self.raise_on_ptr
-            return self.ptr_records
+            return [_rdata("PTR", p) for p in self.ptr_records]
         raise AssertionError(f"unexpected rdtype {rdtype!r}")
 
 
+def _rdata(rdtype, text):
+    """Parse `text` into IN-class rdata of `rdtype`, e.g. ("PTR", "example.com.")."""
+    return dns.rdata.from_text(dns.rdataclass.IN, dns.rdatatype.from_text(rdtype), text)
+
+
+# Each failure with the level it should be logged at: resolver trouble is an
+# ERROR, a negative answer a WARNING.
 DNS_FAILURES = [
-    pytest.param(dns.resolver.NXDOMAIN(), id="NXDOMAIN"),
-    pytest.param(dns.resolver.NoAnswer(), id="NoAnswer"),
-    pytest.param(dns.exception.Timeout(), id="Timeout"),
-    pytest.param(dns.resolver.NoNameservers(), id="NoNameservers"),
+    pytest.param(dns.resolver.NXDOMAIN(), "WARNING", id="NXDOMAIN"),
+    pytest.param(dns.resolver.NoAnswer(), "WARNING", id="NoAnswer"),
+    pytest.param(dns.exception.Timeout(), "ERROR", id="Timeout"),
+    # What dnspython 2.x raises in production when resolver.lifetime runs out.
+    pytest.param(
+        dns.resolver.LifetimeTimeout(timeout=0.5, errors=[]),
+        "ERROR",
+        id="LifetimeTimeout",
+    ),
+    pytest.param(dns.resolver.NoNameservers(), "ERROR", id="NoNameservers"),
 ]
 
 
@@ -279,7 +294,7 @@ class TestIsValidAcmeUpdate:
         # The PTR lookup must go through the injected resolver, not the
         # module-level dns.resolver.query (see the FakeResolver docstring).
         assert [(str(name), rdtype) for name, rdtype in resolver.calls] == [
-            ("example.com", "A"),
+            ("example.com.", "A"),
             ("1.1.168.192.in-addr.arpa.", "PTR"),
         ]
 
@@ -306,8 +321,32 @@ class TestIsValidAcmeUpdate:
         )
         assert nap.is_valid_acme_update(msg, {"certbot": {}}, resolver) is False
 
-    @pytest.mark.parametrize("exc", DNS_FAILURES)
-    def test_forward_lookup_failure_denies_without_ptr_lookup(self, exc, caplog):
+    def test_ptr_match_ignores_case(self):
+        msg = {
+            "signer": "certbot",
+            "rr_name": "_acme-challenge.example.com",
+            "src_addr": "192.168.1.1",
+            "rr_type": "TXT",
+        }
+        resolver = FakeResolver(a_records=["203.0.113.5"], ptr_records=["Example.COM."])
+        assert nap.is_valid_acme_update(msg, {"certbot": {}}, resolver) is True
+
+    def test_forward_lookup_uses_absolute_name(self):
+        # A relative name would let query() append the search domain, which
+        # Resolver(configure=False) still derives from the host's FQDN.
+        msg = {
+            "signer": "certbot",
+            "rr_name": "_acme-challenge.example.com",
+            "src_addr": "10.0.0.1",
+            "rr_type": "TXT",
+        }
+        resolver = FakeResolver(a_records=["10.0.0.1"])
+        nap.is_valid_acme_update(msg, {"certbot": {}}, resolver)
+        ((name, _),) = resolver.calls
+        assert name.is_absolute()
+
+    @pytest.mark.parametrize(("exc", "level"), DNS_FAILURES)
+    def test_forward_lookup_failure_denies_without_ptr_lookup(self, exc, level, caplog):
         # A failed forward lookup ends evaluation and is logged here rather
         # than propagated to main(), whose log line would lack context.
         msg = {
@@ -319,8 +358,10 @@ class TestIsValidAcmeUpdate:
         resolver = FakeResolver(raise_on_a=exc, ptr_records=["example.com."])
         assert nap.is_valid_acme_update(msg, {"certbot": {}}, resolver) is False
         assert [rdtype for _, rdtype in resolver.calls] == ["A"]
-        assert (
-            f"Forward lookup of example.com failed: {type(exc).__name__}" in caplog.text
+        (record,) = caplog.records
+        assert record.levelname == level
+        assert record.message.startswith(
+            f"Forward lookup of example.com failed: {type(exc).__name__}"
         )
 
     def test_forward_match_grants_without_ptr_lookup(self):
@@ -339,8 +380,8 @@ class TestIsValidAcmeUpdate:
         assert nap.is_valid_acme_update(msg, {"certbot": {}}, resolver) is True
         assert [rdtype for _, rdtype in resolver.calls] == ["A"]
 
-    @pytest.mark.parametrize("exc", DNS_FAILURES)
-    def test_ptr_lookup_failure_without_forward_match_denies(self, exc, caplog):
+    @pytest.mark.parametrize(("exc", "level"), DNS_FAILURES)
+    def test_ptr_lookup_failure_without_forward_match_denies(self, exc, level, caplog):
         msg = {
             "signer": "certbot",
             "rr_name": "_acme-challenge.example.com",
@@ -349,19 +390,25 @@ class TestIsValidAcmeUpdate:
         }
         resolver = FakeResolver(a_records=["203.0.113.5"], raise_on_ptr=exc)
         assert nap.is_valid_acme_update(msg, {"certbot": {}}, resolver) is False
-        assert (
+        (record,) = caplog.records
+        assert record.levelname == level
+        assert record.message.startswith(
             f"Reverse lookup of 144.92.100.35 failed: {type(exc).__name__}"
-            in caplog.text
         )
-        assert "--dns" not in caplog.text
+        assert "--dns" not in record.message
 
-    def test_private_address_ptr_nxdomain_log_points_at_dns_option(self, caplog):
+    @pytest.mark.parametrize(
+        "src_addr", ["10.128.108.231", "100.64.1.1", "fd00::1"], ids=str
+    )
+    def test_non_global_address_ptr_nxdomain_log_points_at_dns_option(
+        self, src_addr, caplog
+    ):
         # The case that prompted the hint: a public --dns resolver answers
-        # NXDOMAIN for a private address's PTR.
+        # NXDOMAIN for a private (or e.g. CGNAT) address's PTR.
         msg = {
             "signer": "certbot",
             "rr_name": "_acme-challenge.example.com",
-            "src_addr": "10.128.108.231",
+            "src_addr": src_addr,
             "rr_type": "TXT",
         }
         resolver = FakeResolver(
@@ -369,23 +416,30 @@ class TestIsValidAcmeUpdate:
         )
         assert nap.is_valid_acme_update(msg, {"certbot": {}}, resolver) is False
         assert (
-            "Reverse lookup of 10.128.108.231 failed: NXDOMAIN"
-            " (private address: does --dns serve its reverse zone?)" in caplog.text
+            f"Reverse lookup of {src_addr} failed: NXDOMAIN"
+            " (non-global address: does --dns serve its reverse zone?)" in caplog.text
         )
 
-    def test_private_address_ptr_timeout_log_has_no_reverse_zone_hint(self, caplog):
-        # The hint explains NXDOMAIN; for a timeout it would mislead.
+    @pytest.mark.parametrize(
+        "exc",
+        [
+            dns.exception.Timeout(),
+            dns.resolver.NoAnswer(),
+            dns.resolver.NoNameservers(),
+        ],
+        ids=lambda e: type(e).__name__,
+    )
+    def test_non_global_address_other_ptr_failure_log_has_no_hint(self, exc, caplog):
+        # The hint explains NXDOMAIN; for other failures it would mislead.
         msg = {
             "signer": "certbot",
             "rr_name": "_acme-challenge.example.com",
             "src_addr": "10.0.0.1",
             "rr_type": "TXT",
         }
-        resolver = FakeResolver(
-            a_records=["203.0.113.5"], raise_on_ptr=dns.exception.Timeout()
-        )
+        resolver = FakeResolver(a_records=["203.0.113.5"], raise_on_ptr=exc)
         assert nap.is_valid_acme_update(msg, {"certbot": {}}, resolver) is False
-        assert "Reverse lookup of 10.0.0.1 failed: Timeout" in caplog.text
+        assert f"Reverse lookup of 10.0.0.1 failed: {type(exc).__name__}" in caplog.text
         assert "--dns" not in caplog.text
 
     def test_mismatch_log_shows_what_dns_returned(self, caplog):
@@ -429,6 +483,23 @@ class TestIsValidAcmeUpdate:
         resolver = FakeResolver(a_records=["203.0.113.5"])
         with pytest.raises(Exception):  # noqa: B017 -- dnspython's own error type
             nap.is_valid_acme_update(msg, {"certbot": {}}, resolver)
+
+
+class TestIsNonGlobal:
+    @pytest.mark.parametrize(
+        ("addr", "expected"),
+        [
+            ("10.0.0.1", True),
+            ("100.64.1.1", True),  # CGNAT: neither private nor global
+            ("fd00::1", True),
+            ("144.92.100.35", False),
+            ("2001:4860:4860::8888", False),
+            # dnspython 1.x passes this through; ipaddress rejects it.
+            ("010.0.0.1", False),
+        ],
+    )
+    def test_classifies(self, addr, expected):
+        assert nap._is_non_global(addr) is expected
 
 
 def _capture_exiting_output(argv, capsys):
