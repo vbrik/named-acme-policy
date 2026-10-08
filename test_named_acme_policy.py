@@ -133,13 +133,12 @@ class FakeResolver:
 
     def query(self, name, rdtype):
         self.calls.append((name, rdtype))
-        match rdtype:
-            case "A":
-                exc, records = self.raise_on_a, self.a_records
-            case "PTR":
-                exc, records = self.raise_on_ptr, self.ptr_records
-            case _:
-                raise AssertionError(f"unexpected rdtype {rdtype!r}")
+        if rdtype == "A":
+            exc, records = self.raise_on_a, self.a_records
+        elif rdtype == "PTR":
+            exc, records = self.raise_on_ptr, self.ptr_records
+        else:
+            raise AssertionError(f"unexpected rdtype {rdtype!r}")
         if exc is not None:
             raise exc
         if not records:
@@ -158,14 +157,18 @@ DNS_FAILURES = [
     pytest.param(dns.resolver.NXDOMAIN(), "WARNING", id="NXDOMAIN"),
     pytest.param(dns.resolver.NoAnswer(), "WARNING", id="NoAnswer"),
     pytest.param(dns.exception.Timeout(), "ERROR", id="Timeout"),
-    # What dnspython 2.x raises in production when resolver.lifetime runs out.
-    pytest.param(
-        dns.resolver.LifetimeTimeout(timeout=0.5, errors=[]),
-        "ERROR",
-        id="LifetimeTimeout",
-    ),
     pytest.param(dns.resolver.NoNameservers(), "ERROR", id="NoNameservers"),
 ]
+# What dnspython >= 2.2 raises in production when resolver.lifetime runs out;
+# older versions, such as RHEL 8's 1.15, raise plain Timeout and lack the class.
+if hasattr(dns.resolver, "LifetimeTimeout"):
+    DNS_FAILURES.append(
+        pytest.param(
+            dns.resolver.LifetimeTimeout(timeout=0.5, errors=[]),
+            "ERROR",
+            id="LifetimeTimeout",
+        )
+    )
 
 
 class TestIsValidAcmeUpdate:
@@ -635,7 +638,11 @@ def _local_non_loopback_address():
     """
     try:
         out = subprocess.run(
-            ["ip", "-j", "addr"], capture_output=True, check=True, text=True
+            ["ip", "-j", "addr"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=True,
+            universal_newlines=True,
         ).stdout
     except (OSError, subprocess.CalledProcessError):
         return None

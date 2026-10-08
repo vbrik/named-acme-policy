@@ -1,0 +1,8 @@
+# The daemon must run on Python 3.6.8 (RHEL/CentOS 7 and 8). py37 is the
+# oldest target ruff supports; it still flags newer syntax such as := and match.
+target-version = "py37"
+
+[lint]
+# These rewrite subprocess.run() calls to 3.7-only keyword arguments
+# (text=, capture_output=), which --fix would apply silently.
+ignore = ["UP021", "UP022"]

@@ -13,6 +13,11 @@ via RFC 2136.
 Run `named-acme-policy.py --help` for the available options, or
 `--detailed-help` for the security model and named(8) setup notes.
 
+Requires Python 3.6.8 or newer and [dnspython](https://www.dnspython.org/)
+1.15 or newer, so it runs on the stock `python3` of RHEL/CentOS 7 and 8.
+On RHEL 8 install the `python3-dns` package; on CentOS 7, `pip3 install
+dnspython`.
+
 The daemon allows dynamic DNS updates if they meet the following criteria:
 * Name of the DNS resource record being updated starts with `_acme-challenge.`.
 * The update request has been signed by a TSIG key/identity configured via `--signer-maps`.
@@ -74,3 +79,6 @@ Unit tests cover request parsing and the update-approval logic. Run them with:
 pip install -r requirements.txt pytest
 pytest
 ```
+The suite must also pass on Python 3.6 (pytest 7.0 is the last release that
+supports it). `ruff.toml` targets the oldest Python version ruff supports (3.7),
+so `ruff check` flags newer syntax such as `:=` and `match`.

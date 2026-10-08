@@ -308,7 +308,8 @@ def main():
     args = parser.parse_args()
     # The resolver probe below would pass against the local named(8): the deadlock
     # only strikes once named(8) awaits a decision, so it must be caught here.
-    if local := [addr for addr in args.dns if _is_local_address(addr)]:
+    local = [addr for addr in args.dns if _is_local_address(addr)]
+    if local:
         parser.error(
             f"--dns must not point at this host ({' '.join(local)}): named(8) "
             "blocks while awaiting our decisions, so it can't answer our lookups. "
