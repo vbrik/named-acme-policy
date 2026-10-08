@@ -16,14 +16,16 @@ Run `named-acme-policy.py --help` for the available options, or
 The daemon allows dynamic DNS updates if they meet the following criteria:
 * Name of the DNS resource record being updated starts with `_acme-challenge.`.
 * The update request has been signed by a TSIG key/identity configured via `--signer-maps`.
-* Either: (1) the domain name of the challenge (the part after `_acme-challenge.`)
-resolves to the IP address from which the update request originated,
-OR (2) the request's source address resolves to the domain name of the
-challenge (this is for multi-homed cases, where the request comes from an internal
-address but the domain resolves to the external address; it is tried only if the
-domain has an A record),
-OR (3) the request's source address maps to the requested domain (or to `*`,
-meaning any domain) for that signer in the `--signer-maps` file.
+* At least one of the following holds:
+  * The challenge's domain (the part after `_acme-challenge.`) resolves to the
+    request's source address.
+  * The source address reverse-resolves to the domain. This covers multi-homed
+    hosts that send from an internal address while the domain resolves to an
+    external one. It is tried only if the domain has an A record.
+    * If private source addresses are involved, set `--dns` to a resolver that
+      can reverse-resolve private IPs. The default public resolvers can't.
+  * The source address maps to the domain (or to `*`, meaning any domain) for
+    that signer in the `--signer-maps` file.
 
 `--signer-maps` is a JSON file of per-signer static IP-to-domain overrides, e.g.:
 ```json
