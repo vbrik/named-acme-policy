@@ -16,7 +16,6 @@
 - Structure code for human readability
 - Good comments: concise
 - Write doc strings except for trivial functions
-- Use latest available python features and syntax when it makes code better
 - Assume the reader is a python expert
 - Run `ruff` on python files (make both "format" and "check" subcommands happy)
 - Use best practices of the programming language you are using
