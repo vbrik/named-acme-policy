@@ -42,6 +42,11 @@ WHY A SEPARATE DNS SERVER
   daemon makes to reach a decision. Pointing --dns at the local named(8) therefore
   deadlocks. It must name a different resolver.
 
+  The daemon refuses to start if any --dns address belongs to this host, loopback
+  and 0.0.0.0 included, even if what listens there isn't named(8). It can't detect
+  indirect loops: a resolver elsewhere that forwards to this named(8), a NAT or
+  port forward leading back here, or a VIP this host may take over later.
+
   For the reverse lookup to work for hosts that send from private addresses
   (10.0.0.0/8 and the like), that resolver must also serve their reverse zones.
   Public resolvers, including the 8.8.8.8 default, answer NXDOMAIN for those.
@@ -189,6 +194,42 @@ def _log_lookup_failure(what, exc, hint=""):
         logger.warning(f"{what} failed: {type(exc).__name__}{hint}")
 
 
+def _is_local_address(addr):
+    """Whether IP address `addr` reaches this host: loopback, unspecified (which
+    the kernel routes to loopback), or assigned to one of its interfaces.
+
+    The last is tested by connecting a UDP socket, which sends nothing, and
+    checking that the kernel picked `addr` itself as the source address, which it
+    does only for local destinations. Unlike test-binding to `addr`, this holds
+    when the ip_nonlocal_bind sysctl lets any address be bound.
+    """
+    ip = ipaddress.ip_address(addr)
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
+        ip = ip.ipv4_mapped
+    if ip.is_loopback or ip.is_unspecified:
+        return True
+    try:
+        family, type_, proto, _, sockaddr = socket.getaddrinfo(
+            str(ip), 53, type=socket.SOCK_DGRAM, flags=socket.AI_NUMERICHOST
+        )[0]
+        with socket.socket(family, type_, proto) as s:
+            s.connect(sockaddr)
+            return ipaddress.ip_address(s.getsockname()[0]) == ip
+    # No route, no IPv6 support, a link-local address lacking a scope: none of
+    # these can be an address of ours that a resolver would use.
+    except OSError:
+        return False
+
+
+def _ip_address(value):
+    """argparse type: `value` unchanged if it is an IP address."""
+    try:
+        ipaddress.ip_address(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not an IP address: {value!r}") from None
+    return value
+
+
 def _is_non_global(addr):
     """Whether `addr` is an IP address outside globally routable space."""
     try:
@@ -239,11 +280,12 @@ def build_parser():
     parser.add_argument(
         "--dns",
         metavar="IP",
+        type=_ip_address,
         nargs="+",
         default=["8.8.8.8", "8.8.4.4"],
         help="resolver(s) used to verify request source addresses; must not be "
-        "the named(8) this daemon serves, which would deadlock "
-        "(default: 8.8.8.8 8.8.4.4)",
+        "the named(8) this daemon serves, which would deadlock, so addresses of "
+        "this host are rejected (default: 8.8.8.8 8.8.4.4)",
     )
     parser.add_argument(
         "--signer-maps",
@@ -264,6 +306,14 @@ def build_parser():
 def main():
     parser = build_parser()
     args = parser.parse_args()
+    # The resolver probe below would pass against the local named(8): the deadlock
+    # only strikes once named(8) awaits a decision, so it must be caught here.
+    if local := [addr for addr in args.dns if _is_local_address(addr)]:
+        parser.error(
+            f"--dns must not point at this host ({' '.join(local)}): named(8) "
+            "blocks while awaiting our decisions, so it can't answer our lookups. "
+            "See --detailed-help."
+        )
 
     logging.basicConfig(
         filename=args.log_file,

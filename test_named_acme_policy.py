@@ -6,8 +6,13 @@ loads it through a custom loader that also skips the bytecode cache.
 
 import importlib.machinery
 import importlib.util
+import ipaddress
+import json
 import os
 import re
+import socket
+import subprocess
+import sys
 from pathlib import Path
 
 import dns.exception
@@ -622,3 +627,121 @@ class TestModuleLoader:
         probe.write_text("VALUE = 'bbb'\n")  # same byte count
         os.utime(probe, (before.st_atime, before.st_mtime))
         assert _load_module(probe).VALUE == "bbb"
+
+
+def _local_non_loopback_address():
+    """An address assigned to this host other than loopback, via iproute2, which
+    is independent of the method under test; None if unavailable.
+    """
+    try:
+        out = subprocess.run(
+            ["ip", "-j", "addr"], capture_output=True, check=True, text=True
+        ).stdout
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    for iface in json.loads(out):
+        for info in iface.get("addr_info", []):
+            ip = ipaddress.ip_address(info["local"])
+            if not (ip.is_loopback or ip.is_link_local):
+                return str(ip)
+    return None
+
+
+class TestIsLocalAddress:
+    @pytest.mark.parametrize(
+        "addr",
+        [
+            "127.0.0.1",
+            "127.0.0.53",  # systemd-resolved's stub: any of 127/8, not just .1
+            "::1",
+            "0.0.0.0",  # routed to loopback
+            "::",
+            "::ffff:127.0.0.1",  # IPv4-mapped loopback
+        ],
+    )
+    def test_loopback_and_unspecified_are_local(self, addr):
+        assert nap._is_local_address(addr) is True
+
+    @pytest.mark.parametrize(
+        "addr",
+        [
+            "192.0.2.1",  # TEST-NET-1
+            "2001:db8::1",  # documentation prefix; likely unroutable here
+            "::ffff:192.0.2.1",
+            "fe80::1",  # link-local without a scope: connect() fails
+        ],
+    )
+    def test_foreign_addresses_are_not_local(self, addr):
+        assert nap._is_local_address(addr) is False
+
+    def test_interface_address_is_local(self):
+        addr = _local_non_loopback_address()
+        if addr is None:
+            pytest.skip("no non-loopback address, or no iproute2, on this host")
+        assert nap._is_local_address(addr) is True
+
+    def test_ignores_ip_nonlocal_bind(self, monkeypatch):
+        # Under that sysctl any bind() succeeds; make it so here and check
+        # that the result doesn't rely on bind().
+        monkeypatch.setattr(socket.socket, "bind", lambda self, addr: None)
+        assert nap._is_local_address("192.0.2.1") is False
+
+
+class TestDnsArgument:
+    def _parse(self, *dns):
+        return nap.build_parser().parse_args(["--socket", "/x", "--dns", *dns])
+
+    def test_accepts_ipv4_and_ipv6(self):
+        assert self._parse("192.0.2.1", "2001:db8::1").dns == [
+            "192.0.2.1",
+            "2001:db8::1",
+        ]
+
+    def test_rejects_hostname(self, capsys):
+        with pytest.raises(SystemExit) as exc_info:
+            self._parse("dns.google")
+        assert exc_info.value.code == 2
+        assert "not an IP address: 'dns.google'" in capsys.readouterr().err
+
+
+class TestMainRejectsLocalDns:
+    @pytest.fixture
+    def no_network(self, monkeypatch):
+        """Fail the test if main() gets as far as its resolver probe."""
+
+        def query(*args, **kwargs):
+            raise AssertionError("main() reached a DNS lookup")
+
+        monkeypatch.setattr(dns.resolver.Resolver, "query", query)
+
+    def _run_main(self, monkeypatch, capsys, *dns):
+        monkeypatch.setattr(
+            sys, "argv", ["named-acme-policy.py", "--socket", "/x", "--dns", *dns]
+        )
+        with pytest.raises(SystemExit) as exc_info:
+            nap.main()
+        return exc_info.value.code, capsys.readouterr().err
+
+    @pytest.mark.usefixtures("no_network")
+    def test_exits_before_any_lookup(self, monkeypatch, capsys):
+        code, err = self._run_main(monkeypatch, capsys, "127.0.0.1")
+        assert code == 2
+        assert "--dns must not point at this host (127.0.0.1)" in err
+
+    @pytest.mark.usefixtures("no_network")
+    def test_one_local_among_several_suffices_and_is_named(self, monkeypatch, capsys):
+        code, err = self._run_main(
+            monkeypatch, capsys, "192.0.2.1", "::1", "192.0.2.2", "127.0.0.53"
+        )
+        assert code == 2
+        assert "(::1 127.0.0.53)" in err
+
+    def test_remote_dns_passes_the_check(self, monkeypatch, capsys):
+        # Stop at the resolver probe, which comes right after the check.
+        def query(*args, **kwargs):
+            raise dns.exception.Timeout
+
+        monkeypatch.setattr(dns.resolver.Resolver, "query", query)
+        code, err = self._run_main(monkeypatch, capsys, "192.0.2.1")
+        assert code == 1
+        assert "--dns servers failed test" in err

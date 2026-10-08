@@ -61,6 +61,12 @@ configuration file:
 `--signer-maps` wildcard above: replacing it with any other string wouldn't change
 anything.)
 
+`--dns` must name a resolver other than the named(8) the daemon serves:
+named(8) blocks while it waits for the daemon's decision, so it can't answer the
+daemon's lookups, and the two deadlock. The daemon refuses to start if any
+`--dns` address belongs to its own host, loopback included. It can't detect
+indirect loops, such as a remote resolver that forwards back to this named(8).
+
 ## Testing
 
 Unit tests cover request parsing and the update-approval logic. Run them with:
