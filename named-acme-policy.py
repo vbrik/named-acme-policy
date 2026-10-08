@@ -7,6 +7,7 @@ model). Keep operator-facing explanation there rather than duplicating it here.
 """
 
 import argparse
+import ipaddress
 import json
 import logging
 import shutil
@@ -15,6 +16,7 @@ import struct
 import sys
 from pathlib import Path
 
+import dns.exception
 import dns.resolver
 import dns.reversename
 
@@ -39,6 +41,10 @@ WHY A SEPARATE DNS SERVER
   daemon makes to reach a decision. Pointing --dns at the local named(8) therefore
   deadlocks. It must name a different resolver.
 
+  For the reverse lookup to work for hosts that send from private addresses
+  (10.0.0.0/8 and the like), that resolver must also serve their reverse zones.
+  Public resolvers, including the 8.8.8.8 default, answer NXDOMAIN for those.
+
 
 SECURITY MODEL
 
@@ -60,6 +66,9 @@ SECURITY MODEL
         - the source address reverse-resolves to the domain, which covers
           multi-homed hosts that send from an internal address while the domain
           publishes an external one.
+
+      Both DNS checks need the domain to resolve: if its forward lookup fails,
+      the request is denied without trying the reverse lookup.
 
 
 SIGNER MAPS FILE
@@ -123,30 +132,40 @@ def is_valid_acme_update(msg, signers, resolver):
     # the domain resolves to the source address (1-to-1 and round-robin hosts), or
     # the source address reverse-resolves to the domain (multi-homed hosts, which
     # send from an internal address while the domain publishes an external one).
+    # Lookup failures deny here rather than propagating to main(), whose log
+    # would carry only dnspython's context-free message.
+    src_addr = msg["src_addr"]
     try:
         domain_addrs = [str(a) for a in resolver.query(domain, "A")]
-    except dns.resolver.NoAnswer:
-        logger.error(f"Failed to resolve {domain}.")
+    except dns.exception.DNSException as e:
+        logger.warning(f"Forward lookup of {domain} failed: {type(e).__name__}")
         return False
+    if src_addr in domain_addrs:
+        logger.info(f"Granting {msg} via forward lookup for signer {msg['signer']!r}.")
+        return True
+
+    # Only now is the reverse lookup needed: doing it up front would let its
+    # failure deny a request the forward match already justifies.
+    rev_name = dns.reversename.from_address(src_addr)  # e.g. 8.8.8.8.in-addr.arpa.
     try:
-        rev_name = dns.reversename.from_address(
-            msg["src_addr"]
-        )  # e.g. 8.8.8.8.in-addr.arpa
-        src_ptr_names = [str(a) for a in resolver.query(rev_name, "PTR")]
-    except dns.resolver.NoAnswer:
-        logger.warning(f"Reverse DNS lookup failed for {msg['src_addr']}.")
-        src_ptr_names = []
-    if msg["src_addr"] not in domain_addrs and domain + "." not in src_ptr_names:
-        logger.info(
-            f"Request {msg} failed to pass source security check:"
-            f" {domain} doesn't resolve to {msg['src_addr']}"
-            f" and {msg['src_addr']} doesn't resolve to {domain}"
-        )
+        src_ptr_names = [str(n) for n in resolver.query(rev_name, "PTR")]
+    except dns.exception.DNSException as e:
+        # Public resolvers answer NXDOMAIN for private reverse zones.
+        hint = ""
+        if (
+            isinstance(e, dns.resolver.NXDOMAIN)
+            and ipaddress.ip_address(src_addr).is_private
+        ):
+            hint = " (private address: does --dns serve its reverse zone?)"
+        logger.warning(f"Reverse lookup of {src_addr} failed: {type(e).__name__}{hint}")
         return False
+    if domain + "." in src_ptr_names:
+        logger.info(f"Granting {msg} via reverse lookup for signer {msg['signer']!r}.")
+        return True
     logger.info(
-        f"Granting {msg} via source-address verification for signer {msg['signer']!r}."
+        f"Source check failed: {domain} -> {domain_addrs}, {src_addr} -> {src_ptr_names}"
     )
-    return True
+    return False
 
 
 class _DetailedHelpAction(argparse.Action):

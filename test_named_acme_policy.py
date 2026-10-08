@@ -10,6 +10,7 @@ import os
 import re
 from pathlib import Path
 
+import dns.exception
 import dns.resolver
 import pytest
 
@@ -106,10 +107,12 @@ class FakeResolver:
     """Stubs the `resolver` argument for both the A and PTR lookups.
 
     is_valid_acme_update uses this same injected resolver for both queries
-    (see note (B) in the script's --help epilog: a non-local resolver is
+    (DETAILED_HELP's "WHY A SEPARATE DNS SERVER": a non-local resolver is
     required to avoid deadlock, since named(8) evaluates this synchronously
     against itself), so a single stub tracking both is enough.
     """
+
+    nameservers = ("192.0.2.53",)
 
     def __init__(
         self, a_records=(), ptr_records=(), raise_on_a=None, raise_on_ptr=None
@@ -131,6 +134,14 @@ class FakeResolver:
                 raise self.raise_on_ptr
             return self.ptr_records
         raise AssertionError(f"unexpected rdtype {rdtype!r}")
+
+
+DNS_FAILURES = [
+    pytest.param(dns.resolver.NXDOMAIN(), id="NXDOMAIN"),
+    pytest.param(dns.resolver.NoAnswer(), id="NoAnswer"),
+    pytest.param(dns.exception.Timeout(), id="Timeout"),
+    pytest.param(dns.resolver.NoNameservers(), id="NoNameservers"),
+]
 
 
 class TestIsValidAcmeUpdate:
@@ -266,7 +277,7 @@ class TestIsValidAcmeUpdate:
         resolver = FakeResolver(a_records=["203.0.113.5"], ptr_records=["example.com."])
         assert nap.is_valid_acme_update(msg, {"certbot": {}}, resolver) is True
         # The PTR lookup must go through the injected resolver, not the
-        # module-level dns.resolver.query, per note (B) in the --help epilog.
+        # module-level dns.resolver.query (see the FakeResolver docstring).
         assert [(str(name), rdtype) for name, rdtype in resolver.calls] == [
             ("example.com", "A"),
             ("1.1.168.192.in-addr.arpa.", "PTR"),
@@ -295,31 +306,27 @@ class TestIsValidAcmeUpdate:
         )
         assert nap.is_valid_acme_update(msg, {"certbot": {}}, resolver) is False
 
-    def test_forward_resolution_no_answer_denies(self):
+    @pytest.mark.parametrize("exc", DNS_FAILURES)
+    def test_forward_lookup_failure_denies_without_ptr_lookup(self, exc, caplog):
+        # A failed forward lookup ends evaluation and is logged here rather
+        # than propagated to main(), whose log line would lack context.
         msg = {
             "signer": "certbot",
             "rr_name": "_acme-challenge.example.com",
             "src_addr": "10.0.0.1",
             "rr_type": "TXT",
         }
-        resolver = FakeResolver(raise_on_a=dns.resolver.NoAnswer())
+        resolver = FakeResolver(raise_on_a=exc, ptr_records=["example.com."])
         assert nap.is_valid_acme_update(msg, {"certbot": {}}, resolver) is False
+        assert [rdtype for _, rdtype in resolver.calls] == ["A"]
+        assert (
+            f"Forward lookup of example.com failed: {type(exc).__name__}" in caplog.text
+        )
 
-    def test_forward_resolution_nxdomain_propagates(self):
-        # NXDOMAIN is not a subclass of NoAnswer, so the except clause
-        # doesn't catch it; the caller (main's request loop) is responsible
-        # for treating any uncaught exception here as a denial.
-        msg = {
-            "signer": "certbot",
-            "rr_name": "_acme-challenge.example.com",
-            "src_addr": "10.0.0.1",
-            "rr_type": "TXT",
-        }
-        resolver = FakeResolver(raise_on_a=dns.resolver.NXDOMAIN())
-        with pytest.raises(dns.resolver.NXDOMAIN):
-            nap.is_valid_acme_update(msg, {"certbot": {}}, resolver)
-
-    def test_ptr_lookup_no_answer_treated_as_empty_and_falls_back_to_forward(self):
+    def test_forward_match_grants_without_ptr_lookup(self):
+        # Regression: an unrelated PTR failure (NXDOMAIN for a private address
+        # via a public resolver) used to deny requests the forward match
+        # already justified, because the PTR lookup ran unconditionally.
         msg = {
             "signer": "certbot",
             "rr_name": "_acme-challenge.example.com",
@@ -327,11 +334,47 @@ class TestIsValidAcmeUpdate:
             "rr_type": "TXT",
         }
         resolver = FakeResolver(
-            a_records=["10.0.0.1"], raise_on_ptr=dns.resolver.NoAnswer()
+            a_records=["10.0.0.1"], raise_on_ptr=dns.resolver.NXDOMAIN()
         )
         assert nap.is_valid_acme_update(msg, {"certbot": {}}, resolver) is True
+        assert [rdtype for _, rdtype in resolver.calls] == ["A"]
 
-    def test_ptr_lookup_no_answer_and_no_forward_match_denies(self):
+    @pytest.mark.parametrize("exc", DNS_FAILURES)
+    def test_ptr_lookup_failure_without_forward_match_denies(self, exc, caplog):
+        msg = {
+            "signer": "certbot",
+            "rr_name": "_acme-challenge.example.com",
+            "src_addr": "144.92.100.35",
+            "rr_type": "TXT",
+        }
+        resolver = FakeResolver(a_records=["203.0.113.5"], raise_on_ptr=exc)
+        assert nap.is_valid_acme_update(msg, {"certbot": {}}, resolver) is False
+        assert (
+            f"Reverse lookup of 144.92.100.35 failed: {type(exc).__name__}"
+            in caplog.text
+        )
+        assert "--dns" not in caplog.text
+
+    def test_private_address_ptr_nxdomain_log_points_at_dns_option(self, caplog):
+        # The case that prompted the hint: a public --dns resolver answers
+        # NXDOMAIN for a private address's PTR.
+        msg = {
+            "signer": "certbot",
+            "rr_name": "_acme-challenge.example.com",
+            "src_addr": "10.128.108.231",
+            "rr_type": "TXT",
+        }
+        resolver = FakeResolver(
+            a_records=["203.0.113.5"], raise_on_ptr=dns.resolver.NXDOMAIN()
+        )
+        assert nap.is_valid_acme_update(msg, {"certbot": {}}, resolver) is False
+        assert (
+            "Reverse lookup of 10.128.108.231 failed: NXDOMAIN"
+            " (private address: does --dns serve its reverse zone?)" in caplog.text
+        )
+
+    def test_private_address_ptr_timeout_log_has_no_reverse_zone_hint(self, caplog):
+        # The hint explains NXDOMAIN; for a timeout it would mislead.
         msg = {
             "signer": "certbot",
             "rr_name": "_acme-challenge.example.com",
@@ -339,9 +382,26 @@ class TestIsValidAcmeUpdate:
             "rr_type": "TXT",
         }
         resolver = FakeResolver(
-            a_records=["203.0.113.5"], raise_on_ptr=dns.resolver.NoAnswer()
+            a_records=["203.0.113.5"], raise_on_ptr=dns.exception.Timeout()
         )
         assert nap.is_valid_acme_update(msg, {"certbot": {}}, resolver) is False
+        assert "Reverse lookup of 10.0.0.1 failed: Timeout" in caplog.text
+        assert "--dns" not in caplog.text
+
+    def test_mismatch_log_shows_what_dns_returned(self, caplog):
+        caplog.set_level("INFO")
+        msg = {
+            "signer": "certbot",
+            "rr_name": "_acme-challenge.example.com",
+            "src_addr": "192.168.1.1",
+            "rr_type": "TXT",
+        }
+        resolver = FakeResolver(a_records=["203.0.113.5"], ptr_records=["other.com."])
+        assert nap.is_valid_acme_update(msg, {"certbot": {}}, resolver) is False
+        assert (
+            "Source check failed: example.com -> ['203.0.113.5'],"
+            " 192.168.1.1 -> ['other.com.']" in caplog.text
+        )
 
     def test_malformed_rr_name_without_dot_raises(self):
         # split(".", 1) yields a single element; unpacking into
