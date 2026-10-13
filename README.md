@@ -1,3 +1,5 @@
+# named-acme-policy
+
 In a nutshell, this project allows to securely configure ISC bind for
 automatic certificate issuing using ACME DNS-01 challenge
 (for example https://letsencrypt.org/docs/challenge-types/#dns-01-challenge).
@@ -10,13 +12,19 @@ This daemon implements a *somewhat* more secure permissions model than the built
 named(8) mechanisms allow for automated certificate issuance using DNS-01 challenge
 via RFC 2136.
 
-Run `named-acme-policy.py --help` for the available options, or
-`--detailed-help` for the security model and named(8) setup notes.
+## Requirements
 
 Requires Python 3.6.8 or newer and [dnspython](https://www.dnspython.org/)
 1.15 or newer, so it runs on the stock `python3` of RHEL/CentOS 7 and 8.
 On RHEL 8 install the `python3-dns` package; on CentOS 7, `pip3 install
 dnspython`.
+
+## Usage
+
+Run `named-acme-policy.py --help` for the available options, or
+`--detailed-help` for the security model and named(8) setup notes.
+
+## Approval rules
 
 The daemon allows dynamic DNS updates if they meet the following criteria:
 * Name of the DNS resource record being updated starts with `_acme-challenge.`.
@@ -37,6 +45,8 @@ The daemon allows dynamic DNS updates if they meet the following criteria:
     to `*`, meaning any existing domain) for that signer in the `--signer-maps`
     file.
 
+## Signer maps
+
 `--signer-maps` is a JSON file of per-signer static source-to-domain overrides,
 where a source is an IP address or a host name, e.g.:
 ```json
@@ -53,6 +63,8 @@ A `"*"` entry grants blanket `_acme-challenge` write access in every zone
 whose update-policy uses this daemon's socket, so keep it out of zones it
 shouldn't touch.
 
+### Host name sources
+
 Host names let a map follow hosts whose addresses change. A name matches when
 the source address is among its A records, looked up via `--dns` at request
 time (so IPv6 sources never match). A dotless name gets the domain of the
@@ -60,6 +72,8 @@ daemon host's hostname, not `resolv.conf`'s search domain. The daemon refuses to
 start if a name doesn't resolve or its zone has a wildcard A record; later
 lookup failures just skip the entry. Note that whoever controls a mapped name's
 A records (or its CNAME target) gains that entry's grant.
+
+## named(8) configuration
 
 For instructions on how to integrate this daemon with named(8) see
 https://bind9.readthedocs.io/en/latest/reference.html#namedconf-statement-update-policy
@@ -75,6 +89,8 @@ configuration file:
 (the '*' is there just to satisfy the config parser and is unrelated to the
 `--signer-maps` wildcard above: replacing it with any other string wouldn't change
 anything.)
+
+### Choosing the `--dns` resolver
 
 `--dns` must name a resolver other than the named(8) the daemon serves:
 named(8) blocks while it waits for the daemon's decision, so it can't answer the
