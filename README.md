@@ -33,23 +33,33 @@ The daemon allows dynamic DNS updates if they meet the following criteria:
     external one.
     * If private source addresses are involved, set `--dns` to a resolver that
       can reverse-resolve private IPs. The default public resolvers can't.
-  * The source address maps to the domain (or to `*`, meaning any existing
-    domain) for that signer in the `--signer-maps` file.
+  * The source address, or a host name resolving to it, maps to the domain (or
+    to `*`, meaning any existing domain) for that signer in the `--signer-maps`
+    file.
 
-`--signer-maps` is a JSON file of per-signer static IP-to-domain overrides, e.g.:
+`--signer-maps` is a JSON file of per-signer static source-to-domain overrides,
+where a source is an IP address or a host name, e.g.:
 ```json
 {
   "certbot": {"144.92.100.35": ["dtn-2.icecube.wisc.edu"]},
-  "k8s-certbot": {"10.1.2.3": "*", "10.1.2.4": "*"}
+  "k8s-certbot": {"10.1.2.3": "*", "k8s-worker-2.example.org": "*"}
 }
 ```
-Each IP maps to either a list of domains or the literal `"*"` (not a bare
+Each source maps to either a list of domains or the literal `"*"` (not a bare
 domain string), meaning any existing domain — useful for e.g. letting
 Kubernetes workers request certs for arbitrary ingress hostnames under a
 dedicated key.
 A `"*"` entry grants blanket `_acme-challenge` write access in every zone
 whose update-policy uses this daemon's socket, so keep it out of zones it
 shouldn't touch.
+
+Host names let a map follow hosts whose addresses change. A name matches when
+the source address is among its A records, looked up via `--dns` at request
+time (so IPv6 sources never match). A dotless name gets the domain of the
+daemon host's hostname, not `resolv.conf`'s search domain. The daemon refuses to
+start if a name doesn't resolve or its zone has a wildcard A record; later
+lookup failures just skip the entry. Note that whoever controls a mapped name's
+A records (or its CNAME target) gains that entry's grant.
 
 For instructions on how to integrate this daemon with named(8) see
 https://bind9.readthedocs.io/en/latest/reference.html#namedconf-statement-update-policy
@@ -74,7 +84,8 @@ indirect loops, such as a remote resolver that forwards back to this named(8).
 
 ## Testing
 
-Unit tests cover request parsing and the update-approval logic. Run them with:
+Unit tests cover request parsing, signer-map loading and the update-approval
+logic. Run them with:
 ```
 pip install -r requirements.txt pytest
 pytest

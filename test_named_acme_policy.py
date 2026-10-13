@@ -13,9 +13,12 @@ import re
 import socket
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 
 import dns.exception
+import dns.name
 import dns.rdata
 import dns.rdataclass
 import dns.rdatatype
@@ -120,20 +123,44 @@ class FakeResolver:
     against itself), so a single stub tracking both is enough. Records are
     given as text and returned as real rdata, as dnspython would; also like
     dnspython, an empty answer raises NoAnswer rather than returning [].
+
+    `name_a_records` overrides `a_records` per absolute name, e.g.
+    {"host.example.org.": ["10.0.0.1"]}, a value being either records or an
+    exception to raise. `on_query(name, rdtype)` runs before each lookup. Copies,
+    as made to clip `lifetime`, share `calls` and `lifetimes`, which record each
+    lookup and the lifetime it ran with.
     """
 
     def __init__(
-        self, a_records=(), ptr_records=(), raise_on_a=None, raise_on_ptr=None
+        self,
+        a_records=(),
+        ptr_records=(),
+        raise_on_a=None,
+        raise_on_ptr=None,
+        name_a_records=None,
+        on_query=None,
     ):
         self.a_records = list(a_records)
         self.ptr_records = list(ptr_records)
         self.raise_on_a = raise_on_a
         self.raise_on_ptr = raise_on_ptr
+        self.name_a_records = name_a_records or {}
+        self.on_query = on_query
+        self.lifetime = 0.5
         self.calls = []
+        self.lifetimes = []
 
     def query(self, name, rdtype):
         self.calls.append((name, rdtype))
-        if rdtype == "A":
+        self.lifetimes.append(self.lifetime)
+        if self.on_query:
+            self.on_query(name, rdtype)
+        if rdtype == "A" and str(name) in self.name_a_records:
+            entry = self.name_a_records[str(name)]
+            exc, records = (
+                (entry, ()) if isinstance(entry, Exception) else (None, entry)
+            )
+        elif rdtype == "A":
             exc, records = self.raise_on_a, self.a_records
         elif rdtype == "PTR":
             exc, records = self.raise_on_ptr, self.ptr_records
@@ -536,6 +563,602 @@ class TestIsValidAcmeUpdate:
             nap.is_valid_acme_update(msg, {"certbot": {}}, resolver)
 
 
+def _name(text):
+    return dns.name.from_text(text)
+
+
+def _acme_msg(src_addr="10.0.0.1", domain="example.com", signer="certbot"):
+    return {
+        "signer": signer,
+        "rr_name": f"_acme-challenge.{domain}",
+        "src_addr": src_addr,
+        "rr_type": "TXT",
+    }
+
+
+class FakeClock:
+    """Stands in for the `time` module, whose monotonic() only moves on advance()."""
+
+    def __init__(self):
+        self.now = 1000.0
+
+    def monotonic(self):
+        return self.now
+
+    def advance(self, seconds):
+        self.now += seconds
+
+
+class TestNameKeys:
+    """Host-name keys in signer maps, as `load_signer_maps` produces them."""
+
+    HOST = "host.example.org."
+
+    def _looked_up(self, resolver):
+        return [str(name) for name, _ in resolver.calls]
+
+    def test_grants_when_name_resolves_to_source(self, caplog):
+        caplog.set_level("INFO")
+        resolver = FakeResolver(
+            a_records=["203.0.113.5"], name_a_records={self.HOST: ["10.0.0.1"]}
+        )
+        signers = {"certbot": {_name(self.HOST): ["example.com"]}}
+        assert nap.is_valid_acme_update(_acme_msg(), signers, resolver) is True
+        assert self._looked_up(resolver) == ["example.com.", self.HOST]
+        assert f"via static map name {self.HOST} " in caplog.text
+
+    @pytest.mark.parametrize(
+        ("src_addr", "expected"),
+        [("10.0.0.3", True), ("10.0.0.1", False)],
+        ids=["among-them", "not-among-them"],
+    )
+    def test_source_must_be_among_several_addresses(self, src_addr, expected):
+        resolver = FakeResolver(
+            a_records=["203.0.113.5"],
+            ptr_records=["other.example.org."],
+            name_a_records={self.HOST: ["10.0.0.2", "10.0.0.3"]},
+        )
+        signers = {"certbot": {_name(self.HOST): ["example.com"]}}
+        msg = _acme_msg(src_addr=src_addr)
+        assert nap.is_valid_acme_update(msg, signers, resolver) is expected
+
+    def test_name_is_resolved_afresh_on_every_request(self):
+        records = {self.HOST: ["10.0.0.1"]}
+        resolver = FakeResolver(
+            a_records=["203.0.113.5"],
+            ptr_records=["other.example.org."],
+            name_a_records=records,
+        )
+        signers = {"certbot": {_name(self.HOST): ["example.com"]}}
+        assert nap.is_valid_acme_update(_acme_msg(), signers, resolver) is True
+        records[self.HOST] = ["10.0.0.9"]
+        assert nap.is_valid_acme_update(_acme_msg(), signers, resolver) is False
+        assert self._looked_up(resolver).count(self.HOST) == 2
+
+    def test_wildcard_value_grants_any_existing_domain(self):
+        resolver = FakeResolver(
+            a_records=["203.0.113.5"], name_a_records={self.HOST: ["10.0.0.1"]}
+        )
+        signers = {"certbot": {_name(self.HOST): "*"}}
+        msg = _acme_msg(domain="anything.example.net")
+        assert nap.is_valid_acme_update(msg, signers, resolver) is True
+
+    def test_name_not_looked_up_unless_its_value_covers_the_domain(self):
+        resolver = FakeResolver(
+            a_records=["203.0.113.5"],
+            ptr_records=["other.example.org."],
+            name_a_records={self.HOST: ["10.0.0.1"]},
+        )
+        signers = {"certbot": {_name(self.HOST): ["other.example.com"]}}
+        assert nap.is_valid_acme_update(_acme_msg(), signers, resolver) is False
+        assert self.HOST not in self._looked_up(resolver)
+
+    def test_name_not_looked_up_when_an_ip_key_grants(self):
+        resolver = FakeResolver(
+            a_records=["203.0.113.5"], name_a_records={self.HOST: ["10.0.0.1"]}
+        )
+        signers = {
+            "certbot": {"10.0.0.1": ["example.com"], _name(self.HOST): ["example.com"]}
+        }
+        assert nap.is_valid_acme_update(_acme_msg(), signers, resolver) is True
+        assert self._looked_up(resolver) == ["example.com."]
+
+    def test_name_not_looked_up_when_forward_lookup_grants(self):
+        resolver = FakeResolver(
+            a_records=["10.0.0.1"], name_a_records={self.HOST: ["10.0.0.1"]}
+        )
+        signers = {"certbot": {_name(self.HOST): ["example.com"]}}
+        assert nap.is_valid_acme_update(_acme_msg(), signers, resolver) is True
+        assert self._looked_up(resolver) == ["example.com."]
+
+    @pytest.mark.parametrize(("exc", "_level"), DNS_FAILURES)
+    def test_lookup_failure_is_an_error_and_falls_through_to_reverse(
+        self, exc, _level, caplog
+    ):
+        resolver = FakeResolver(
+            a_records=["203.0.113.5"],
+            ptr_records=["example.com."],
+            name_a_records={self.HOST: exc},
+        )
+        signers = {"certbot": {_name(self.HOST): ["example.com"]}}
+        assert nap.is_valid_acme_update(_acme_msg(), signers, resolver) is True
+        assert [rdtype for _, rdtype in resolver.calls] == ["A", "A", "PTR"]
+        errors = [r for r in caplog.records if r.levelname == "ERROR"]
+        assert len(errors) == 1
+        assert errors[0].message.startswith(
+            f"Signer-map name lookup of {self.HOST} failed: {type(exc).__name__}"
+        )
+
+    def test_failed_name_does_not_keep_a_later_one_from_granting(self):
+        resolver = FakeResolver(
+            a_records=["203.0.113.5"],
+            name_a_records={
+                "bad.example.org.": dns.resolver.NXDOMAIN(),
+                self.HOST: ["10.0.0.1"],
+            },
+        )
+        signers = {
+            "certbot": {
+                _name("bad.example.org."): ["example.com"],
+                _name(self.HOST): ["example.com"],
+            }
+        }
+        assert nap.is_valid_acme_update(_acme_msg(), signers, resolver) is True
+
+    def test_ipv6_source_skips_name_keys(self):
+        # Name keys hold A records only, so looking them up can't help.
+        resolver = FakeResolver(
+            a_records=["203.0.113.5"],
+            ptr_records=["other.example.org."],
+            name_a_records={self.HOST: ["10.0.0.1"]},
+        )
+        signers = {"certbot": {_name(self.HOST): "*"}}
+        msg = _acme_msg(src_addr="2001:db8::5")
+        assert nap.is_valid_acme_update(msg, signers, resolver) is False
+        assert self.HOST not in self._looked_up(resolver)
+
+    def test_denial_log_shows_what_names_resolved_to(self, caplog):
+        caplog.set_level("INFO")
+        resolver = FakeResolver(
+            a_records=["203.0.113.5"],
+            ptr_records=["other.example.org."],
+            name_a_records={
+                self.HOST: ["10.0.0.9"],
+                "bad.example.org.": dns.resolver.NXDOMAIN(),
+            },
+        )
+        signers = {"certbot": {_name(self.HOST): "*", _name("bad.example.org."): "*"}}
+        assert nap.is_valid_acme_update(_acme_msg(), signers, resolver) is False
+        (line,) = [m for m in caplog.messages if m.startswith("Source check failed")]
+        assert f"{self.HOST} -> ['10.0.0.9']" in line
+        assert "bad.example.org. -> NXDOMAIN" in line
+
+    def test_names_are_looked_up_in_parallel(self):
+        # A sequential loop would block on the slow name, listed first, before
+        # reaching the matching one.
+        release = threading.Event()
+
+        def on_query(name, rdtype):
+            if str(name) == "slow.example.org.":
+                release.wait(5)
+
+        resolver = FakeResolver(
+            a_records=["203.0.113.5"],
+            name_a_records={"slow.example.org.": [], self.HOST: ["10.0.0.1"]},
+            on_query=on_query,
+        )
+        signers = {"certbot": {_name("slow.example.org."): "*", _name(self.HOST): "*"}}
+        start = time.monotonic()
+        try:
+            assert nap.is_valid_acme_update(_acme_msg(), signers, resolver) is True
+            assert time.monotonic() - start < 1
+        finally:
+            release.set()
+
+    def test_name_step_stops_in_time_for_the_reverse_lookup(self, monkeypatch, caplog):
+        # With a 0.7 budget and a 0.5 lifetime, names get 0.2 s; the hung one
+        # is abandoned and the reverse lookup still grants.
+        monkeypatch.setattr(nap, "DECISION_BUDGET", 0.7)
+        release = threading.Event()
+
+        def on_query(name, rdtype):
+            if str(name) == self.HOST:
+                release.wait(5)
+
+        resolver = FakeResolver(
+            a_records=["203.0.113.5"],
+            ptr_records=["example.com."],
+            name_a_records={self.HOST: ["10.0.0.9"]},
+            on_query=on_query,
+        )
+        signers = {"certbot": {_name(self.HOST): "*"}}
+        start = time.monotonic()
+        try:
+            assert nap.is_valid_acme_update(_acme_msg(), signers, resolver) is True
+            assert time.monotonic() - start < 1
+        finally:
+            release.set()
+        assert (
+            f"Decision budget exhausted awaiting name lookups: {self.HOST}"
+            in caplog.text
+        )
+
+    def test_reverse_lookup_keeps_its_full_lifetime_after_names_hang(self, monkeypatch):
+        clock = FakeClock()
+        monkeypatch.setattr(nap, "time", clock)
+        monkeypatch.setattr(nap, "DECISION_BUDGET", 1.5)
+
+        def on_query(name, rdtype):
+            if str(name) == self.HOST:
+                clock.advance(1.0)  # all the time the name step has
+
+        resolver = FakeResolver(
+            a_records=["203.0.113.5"],
+            ptr_records=["example.com."],
+            name_a_records={self.HOST: dns.exception.Timeout()},
+            on_query=on_query,
+        )
+        signers = {"certbot": {_name(self.HOST): "*"}}
+        assert nap.is_valid_acme_update(_acme_msg(), signers, resolver) is True
+        assert resolver.lifetimes == pytest.approx([0.5, 0.5, 0.5])
+
+    def test_lookups_are_clipped_to_the_decision_deadline(self, monkeypatch):
+        # The existence check uses up 0.8 of the 1.5 budget. The name step, which
+        # leaves the reverse lookup a full 0.5 lifetime, gets the 0.2 between.
+        clock = FakeClock()
+        monkeypatch.setattr(nap, "time", clock)
+        monkeypatch.setattr(nap, "DECISION_BUDGET", 1.5)
+
+        def on_query(name, rdtype):
+            if str(name) == "example.com.":
+                clock.advance(0.8)
+
+        resolver = FakeResolver(
+            a_records=["203.0.113.5"],
+            ptr_records=["other.example.org."],
+            name_a_records={self.HOST: ["10.0.0.9"]},
+            on_query=on_query,
+        )
+        signers = {"certbot": {_name(self.HOST): "*"}}
+        assert nap.is_valid_acme_update(_acme_msg(), signers, resolver) is False
+        assert [rdtype for _, rdtype in resolver.calls] == ["A", "A", "PTR"]
+        assert resolver.lifetimes == pytest.approx([0.5, 0.2, 0.5])
+        assert resolver.lifetime == 0.5
+
+    def test_timeout_of_a_clipped_lookup_blames_the_budget(self, monkeypatch, caplog):
+        clock = FakeClock()
+        monkeypatch.setattr(nap, "time", clock)
+        monkeypatch.setattr(nap, "DECISION_BUDGET", 1.5)
+
+        def on_query(name, rdtype):
+            if str(name) == "example.com.":
+                clock.advance(0.8)
+
+        resolver = FakeResolver(
+            a_records=["203.0.113.5"],
+            ptr_records=["example.com."],
+            name_a_records={self.HOST: dns.exception.Timeout()},
+            on_query=on_query,
+        )
+        signers = {"certbot": {_name(self.HOST): "*"}}
+        assert nap.is_valid_acme_update(_acme_msg(), signers, resolver) is True
+        assert (
+            f"Signer-map name lookup of {self.HOST} failed: Timeout: decision budget"
+            " exhausted (0.200 s were left)" in caplog.text
+        )
+
+    def test_unclipped_timeout_keeps_the_resolver_message(self, caplog):
+        exc = dns.exception.Timeout()
+        resolver = FakeResolver(
+            a_records=["203.0.113.5"],
+            ptr_records=["example.com."],
+            name_a_records={self.HOST: exc},
+        )
+        signers = {"certbot": {_name(self.HOST): "*"}}
+        assert nap.is_valid_acme_update(_acme_msg(), signers, resolver) is True
+        assert f"failed: Timeout: {exc}" in caplog.text
+
+    def test_no_lookup_is_started_past_the_deadline(self, monkeypatch, caplog):
+        clock = FakeClock()
+        monkeypatch.setattr(nap, "time", clock)
+        monkeypatch.setattr(nap, "DECISION_BUDGET", 1.5)
+
+        def on_query(name, rdtype):
+            clock.advance(1.6)
+
+        resolver = FakeResolver(
+            a_records=["203.0.113.5"],
+            ptr_records=["example.com."],
+            name_a_records={self.HOST: ["10.0.0.1"]},
+            on_query=on_query,
+        )
+        signers = {"certbot": {_name(self.HOST): "*"}}
+        assert nap.is_valid_acme_update(_acme_msg(), signers, resolver) is False
+        assert self._looked_up(resolver) == ["example.com."]
+
+    def test_budget_is_per_decision(self, monkeypatch):
+        clock = FakeClock()
+        monkeypatch.setattr(nap, "time", clock)
+        monkeypatch.setattr(nap, "DECISION_BUDGET", 1.5)
+        resolver = FakeResolver(
+            a_records=["203.0.113.5"],
+            ptr_records=["other.example.org."],
+            name_a_records={self.HOST: ["10.0.0.9"]},
+            on_query=lambda name, rdtype: clock.advance(0.45),
+        )
+        signers = {"certbot": {_name(self.HOST): ["example.com"]}}
+        for _ in range(3):
+            nap.is_valid_acme_update(_acme_msg(), signers, resolver)
+        assert [rdtype for _, rdtype in resolver.calls] == ["A", "A", "PTR"] * 3
+
+
+class TestLoadSignerMaps:
+    HOSTNAME = "dns1.example.org"
+
+    def _load(self, tmp_path, content, hostname=HOSTNAME):
+        path = tmp_path / "maps.json"
+        path.write_text(content if isinstance(content, str) else json.dumps(content))
+        return nap.load_signer_maps(str(path), hostname)
+
+    def test_ip_keys_and_values_are_kept(self, tmp_path):
+        content = {
+            "certbot": {"10.0.0.1": ["a.example.com"], "2001:db8::1": "*", "::2": []}
+        }
+        assert self._load(tmp_path, content) == content
+
+    @pytest.mark.parametrize(
+        ("key", "normal"),
+        [("2001:DB8:0::1", "2001:db8::1"), ("2001:0db8:0000::0001", "2001:db8::1")],
+    )
+    def test_ip_keys_are_normalized(self, tmp_path, key, normal):
+        assert self._load(tmp_path, {"c": {key: "*"}}) == {"c": {normal: "*"}}
+
+    def test_ipv4_mapped_key_matches_the_same_source(self, tmp_path):
+        # Python versions disagree on str() of such addresses, so the request's
+        # source address must be normalized the same way as the key.
+        signers = self._load(tmp_path, {"certbot": {"::ffff:10.0.0.1": "*"}})
+        resolver = FakeResolver(a_records=["203.0.113.5"])
+        msg = _acme_msg(src_addr="::ffff:10.0.0.1")
+        assert nap.is_valid_acme_update(msg, signers, resolver) is True
+
+    def test_two_spellings_of_one_address_are_rejected(self, tmp_path):
+        content = {"certbot": {"2001:db8::1": "*", "2001:DB8::1": ["a.example.com"]}}
+        with pytest.raises(ValueError, match="both name 2001:db8::1"):
+            self._load(tmp_path, content)
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            '{"certbot": {"10.0.0.1": "*", "10.0.0.1": ["a.example.com"]}}',
+            '{"certbot": {"10.0.0.1": "*"}, "certbot": {"10.0.0.2": "*"}}',
+        ],
+        ids=["source", "signer"],
+    )
+    def test_duplicate_json_keys_are_rejected(self, tmp_path, content):
+        with pytest.raises(ValueError, match="duplicate key"):
+            self._load(tmp_path, content)
+
+    @pytest.mark.parametrize(
+        "key",
+        [
+            "10.0.0.0/24",
+            "10.0.0.1:53",
+            "10.0.0.1 ",
+            "_comment",
+            "-host.example.org",
+            "host-.example.org",
+            "host_name.example.org",
+            "",
+        ],
+    )
+    def test_non_host_name_key_is_rejected(self, tmp_path, key):
+        with pytest.raises(ValueError, match="neither an IP address nor a host name"):
+            self._load(tmp_path, {"certbot": {key: "*"}})
+
+    @pytest.mark.parametrize(
+        "value", ["example.com", ["a.example.com", 1], 5, None, {"a": 1}, "**"]
+    )
+    def test_value_other_than_star_or_domain_list_is_rejected(self, tmp_path, value):
+        with pytest.raises(ValueError, match='value must be "\\*" or a list'):
+            self._load(tmp_path, {"certbot": {"10.0.0.1": value}})
+
+    def test_unparsable_hostname_matters_only_to_dotless_keys(self, tmp_path):
+        hostname = "x" * 64
+        maps = self._load(tmp_path, {"c": {"h.example.net": "*"}}, hostname=hostname)
+        assert maps == {"c": {_name("h.example.net."): "*"}}
+        with pytest.raises(ValueError, match="has no domain"):
+            self._load(tmp_path, {"c": {"h": "*"}}, hostname=hostname)
+
+    @pytest.mark.parametrize(
+        "key", ["host.example.net", "host.example.net.", "HOST.Example.Net"]
+    )
+    def test_dotted_name_is_taken_as_fully_qualified(self, tmp_path, key):
+        maps = self._load(tmp_path, {"certbot": {key: ["a.example.com"]}})["certbot"]
+        assert maps == {_name("host.example.net."): ["a.example.com"]}
+        (name,) = maps
+        assert name.is_absolute()
+
+    def test_dotless_name_gets_the_host_domain(self, tmp_path):
+        maps = self._load(tmp_path, {"certbot": {"dtn-2": "*"}})["certbot"]
+        assert maps == {_name("dtn-2.example.org."): "*"}
+
+    def test_dotless_name_without_host_domain_is_rejected(self, tmp_path):
+        with pytest.raises(ValueError, match="'dtn-2' has no domain") as exc_info:
+            self._load(tmp_path, {"certbot": {"dtn-2": "*"}}, hostname="dns1")
+        assert "this host's name 'dns1'" in str(exc_info.value)
+
+    def test_dotted_name_needs_no_host_domain(self, tmp_path):
+        maps = self._load(tmp_path, {"c": {"h.example.net": "*"}}, hostname="dns1")
+        assert maps == {"c": {_name("h.example.net."): "*"}}
+
+    @pytest.mark.parametrize(
+        "key", ["10.0.0.256", "1.2.3", "host.123", ".", "a..b", "x" * 64 + ".com"]
+    )
+    def test_implausible_name_is_rejected(self, tmp_path, key):
+        with pytest.raises(ValueError, match=re.escape(repr(key))):
+            self._load(tmp_path, {"certbot": {key: "*"}})
+
+    @pytest.mark.parametrize(
+        ("first", "second"),
+        [("Host.example.org", "host.example.org."), ("dtn-2", "dtn-2.example.org")],
+    )
+    def test_keys_naming_the_same_host_are_rejected(self, tmp_path, first, second):
+        content = f'{{"certbot": {{"{first}": "*", "{second}": ["a.example.com"]}}}}'
+        with pytest.raises(ValueError, match="both name") as exc_info:
+            self._load(tmp_path, content)
+        assert repr(first) in str(exc_info.value)
+        assert repr(second) in str(exc_info.value)
+
+    def test_same_name_under_different_signers_is_fine(self, tmp_path):
+        signers = self._load(
+            tmp_path, {"a": {"h.example.net": "*"}, "b": {"h.example.net": "*"}}
+        )
+        assert set(signers) == {"a", "b"}
+
+    @pytest.mark.parametrize(
+        "content",
+        ["not json", "[]", '{"certbot": []}', '{"certbot": "10.0.0.1"}'],
+    )
+    def test_malformed_file_raises_value_error(self, tmp_path, content):
+        with pytest.raises(ValueError):
+            self._load(tmp_path, content)
+
+    def test_missing_file_raises_os_error(self, tmp_path):
+        with pytest.raises(OSError):
+            nap.load_signer_maps(str(tmp_path / "absent.json"), self.HOSTNAME)
+
+
+class TestHostDomain:
+    @pytest.mark.parametrize(
+        ("hostname", "expected"),
+        [
+            ("dns1.example.org", "example.org."),
+            ("dns1.example.org.", "example.org."),
+            ("dns1.org", "org."),
+            ("dns1", None),
+            ("", None),
+            ("x" * 64 + ".example.org", None),
+        ],
+    )
+    def test_derives(self, hostname, expected):
+        domain = nap._host_domain(hostname)
+        assert (domain and str(domain)) == expected
+
+
+class TestVerifyMapNames:
+    PROBE = re.compile(r"_named-acme-policy-probe-[0-9a-f]{8}\.example\.org\.\Z")
+
+    def test_checks_only_name_keys_and_logs_their_addresses(self, caplog):
+        caplog.set_level("INFO")
+        resolver = FakeResolver(
+            raise_on_a=dns.resolver.NXDOMAIN(),
+            name_a_records={"h.example.org.": ["10.0.0.1"]},
+        )
+        signers = {"certbot": {"10.0.0.2": "*", _name("h.example.org."): "*"}}
+        assert nap.verify_map_names(signers, resolver) == []
+        looked_up = [str(name) for name, _ in resolver.calls]
+        assert looked_up[0] == "h.example.org."
+        assert self.PROBE.match(looked_up[1])
+        assert len(looked_up) == 2
+        assert "map name h.example.org. resolves to ['10.0.0.1']" in caplog.text
+
+    def test_probe_without_a_record_is_no_wildcard(self):
+        # NoAnswer: the zone's wildcard, if any, has no A record.
+        resolver = FakeResolver(name_a_records={"h.example.org.": ["10.0.0.1"]})
+        assert (
+            nap.verify_map_names({"c": {_name("h.example.org."): "*"}}, resolver) == []
+        )
+
+    def test_wildcard_zone_is_reported(self):
+        # Even the misspelled name resolves, through the zone's wildcard.
+        resolver = FakeResolver(a_records=["192.0.2.80"])
+        signers = {"certbot": {_name("k8s-wroker-2.example.org."): "*"}}
+        (failure,) = nap.verify_map_names(signers, resolver)
+        assert failure.startswith(
+            "signer 'certbot': k8s-wroker-2.example.org.: its zone has a wildcard A"
+            " record (_named-acme-policy-probe-"
+        )
+        assert "resolves to ['192.0.2.80']), so a misspelling" in failure
+
+    def test_failed_probe_is_reported(self):
+        resolver = FakeResolver(
+            raise_on_a=dns.exception.Timeout(),
+            name_a_records={"h.example.org.": ["10.0.0.1"]},
+        )
+        (failure,) = nap.verify_map_names(
+            {"c": {_name("h.example.org."): "*"}}, resolver
+        )
+        assert "h.example.org.: wildcard check of _named-acme-policy-probe-" in failure
+        assert "failed: Timeout" in failure
+
+    def test_reports_every_failure_with_its_signer(self):
+        resolver = FakeResolver(
+            raise_on_a=dns.resolver.NXDOMAIN(),
+            name_a_records={
+                "ok.example.org.": ["10.0.0.1"],
+                "gone.example.org.": dns.resolver.NXDOMAIN(),
+                "v6.example.org.": [],
+            },
+        )
+        signers = {
+            "a": {_name("ok.example.org."): "*", _name("gone.example.org."): "*"},
+            "b": {_name("v6.example.org."): "*"},
+        }
+        assert nap.verify_map_names(signers, resolver) == [
+            "signer 'a': gone.example.org.: NXDOMAIN: " + str(dns.resolver.NXDOMAIN()),
+            "signer 'b': v6.example.org.: NoAnswer: " + str(dns.resolver.NoAnswer()),
+        ]
+
+
+class TestMainSignerMaps:
+    def _run_main(self, monkeypatch, capsys, maps_path):
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "named-acme-policy.py",
+                "--socket",
+                "/x",
+                "--dns",
+                "192.0.2.1",
+                "--signer-maps",
+                str(maps_path),
+            ],
+        )
+        monkeypatch.setattr(socket, "gethostname", lambda: "dns1.example.org")
+        with pytest.raises(SystemExit) as exc_info:
+            nap.main()
+        return exc_info.value.code, capsys.readouterr().err
+
+    def test_unresolvable_name_aborts_startup(self, monkeypatch, capsys, tmp_path):
+        def query(self, name, rdtype):
+            if str(name) in ("google.com", "ok.example.net."):
+                return [_rdata("A", "192.0.2.10")]
+            raise dns.resolver.NXDOMAIN
+
+        monkeypatch.setattr(dns.resolver.Resolver, "query", query)
+        maps_path = tmp_path / "maps.json"
+        maps_path.write_text('{"certbot": {"dtn-2": "*", "ok.example.net": "*"}}')
+        code, err = self._run_main(monkeypatch, capsys, maps_path)
+        assert code == 1
+        assert "--signer-maps names failed checks:" in err
+        assert "signer 'certbot': dtn-2.example.org.: NXDOMAIN" in err
+        assert "ok.example.net" not in err
+
+    def test_malformed_file_is_a_usage_error_before_any_lookup(
+        self, monkeypatch, capsys, tmp_path
+    ):
+        def query(*args, **kwargs):
+            raise AssertionError("main() reached a DNS lookup")
+
+        monkeypatch.setattr(dns.resolver.Resolver, "query", query)
+        maps_path = tmp_path / "maps.json"
+        maps_path.write_text('{"certbot": {"10.0.0.256": "*"}}')
+        code, err = self._run_main(monkeypatch, capsys, maps_path)
+        assert code == 2
+        assert f"--signer-maps {maps_path}: '10.0.0.256'" in err
+
+
 class TestIsNonGlobal:
     @pytest.mark.parametrize(
         ("addr", "expected"),
@@ -587,6 +1210,10 @@ class TestDetailedHelp:
             "SIGNER MAPS FILE",
         ):
             assert heading in nap.DETAILED_HELP
+
+    def test_states_the_decision_budget(self):
+        text = " ".join(nap.DETAILED_HELP.split())
+        assert f"about {nap.DECISION_BUDGET:g} seconds at most" in text
 
     def test_bind9_url_is_not_split_across_lines(self):
         # argparse's HelpFormatter used to hyphenate this URL mid-path.
