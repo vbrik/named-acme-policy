@@ -12,15 +12,6 @@ This daemon implements a *somewhat* more secure permissions model than the built
 named(8) mechanisms allow for automated certificate issuance using DNS-01 challenge
 via RFC 2136.
 
-## Requirements
-
-Requires Python 3.6.8 or newer and [dnspython](https://www.dnspython.org/)
-1.15 or newer, so it runs on the stock `python3` of RHEL/CentOS 7 and 8.
-On RHEL 8 install the `python3-dns` package; on CentOS 7, `pip3 install
-dnspython`.
-
-## Usage
-
 Run `named-acme-policy.py --help` for the available options, or
 `--detailed-help` for the security model and named(8) setup notes.
 
@@ -97,6 +88,13 @@ named(8) blocks while it waits for the daemon's decision, so it can't answer the
 daemon's lookups, and the two deadlock. The daemon refuses to start if any
 `--dns` address belongs to its own host, loopback included. It can't detect
 indirect loops, such as a remote resolver that forwards back to this named(8).
+
+## Requirements
+
+Requires Python 3.6.8 or newer and [dnspython](https://www.dnspython.org/)
+1.15 or newer, so it runs on the stock `python3` of RHEL/CentOS 7 and 8.
+On RHEL 8 install the `python3-dns` package; on CentOS 7, `pip3 install
+dnspython`.
 
 ## Testing
 
