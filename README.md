@@ -43,7 +43,10 @@ where a source is an IP address or a host name, e.g.:
 ```json
 {
   "certbot": {"144.92.100.35": ["dtn-2.icecube.wisc.edu"]},
-  "k8s-certbot": {"10.1.2.3": "*", "k8s-worker-2.example.org": "*"}
+  "k8s-certbot": {
+    "10.1.2.3": "*",
+    "k8s-worker-2.example.org": "*"
+  }
 }
 ```
 Each source maps to either a list of domains or the literal `"*"` (not a bare
