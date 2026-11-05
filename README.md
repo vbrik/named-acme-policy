@@ -61,11 +61,19 @@ shouldn't touch.
 
 Host names let a map follow hosts whose addresses change. A name matches when
 the source address is among its A records, looked up via `--dns` at request
-time (so IPv6 sources never match). A dotless name gets the domain of the
-daemon host's hostname, not `resolv.conf`'s search domain. The daemon refuses to
-start if a name doesn't resolve or its zone has a wildcard A record; later
-lookup failures just skip the entry. Note that whoever controls a mapped name's
-A records (or its CNAME target) gains that entry's grant.
+time (so IPv6 sources never match). A dotless name gets the domain given by
+the optional top-level `"_default_domain"` key, or else that of the daemon
+host's hostname (not `resolv.conf`'s search domain):
+```json
+{
+  "_default_domain": "icecube.wisc.edu",
+  "certbot": {"navigator-dev": ["navigator.icecube.wisc.edu"]}
+}
+```
+The daemon refuses to start if a name doesn't resolve or its zone has a
+wildcard A record; later lookup failures just skip the entry. Note that whoever
+controls a mapped name's A records (or its CNAME target) gains that entry's
+grant.
 
 ## named(8) configuration
 

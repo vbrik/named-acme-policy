@@ -35,6 +35,9 @@ logger = logging.getLogger(__name__)
 DECISION_BUDGET = 1.5
 # Most --signer-maps names looked up at once for one decision.
 MAX_PARALLEL_LOOKUPS = 16
+# Top-level --signer-maps key holding the domain for dotless host-name keys. It
+# sits among the signers; the underscore keeps it clear of real TSIG key names.
+DEFAULT_DOMAIN_KEY = "_default_domain"
 
 DETAILED_HELP = """\
 named-acme-policy -- external update-policy decider for ACME DNS-01 challenges
@@ -110,9 +113,14 @@ SIGNER MAPS FILE
   rule or otherwise, wields the entry's grant. That includes whoever controls the
   target of a CNAME the name points to, as the lookup follows it.
 
-  A name with a dot is taken as fully qualified; a dotless one gets this host's
-  domain appended, taken from its hostname (as gethostname(2) reports it), not
-  from resolv.conf. Names must consist of letters, digits and hyphens.
+  A name with a dot is taken as fully qualified; a dotless one gets a domain
+  appended: that of the optional top-level "_default_domain" key, e.g.
+
+      {"_default_domain": "example.org", "certbot": {"dtn-2": ["dtn-2.example.org"]}}
+
+  or else this host's, taken from its hostname (as gethostname(2) reports it),
+  not from resolv.conf. Hence no signer can be named "_default_domain". Names
+  must consist of letters, digits and hyphens.
 
   The daemon refuses to start if a name fails to resolve, or if its zone answers
   for names that don't exist (a wildcard A record), as then a misspelled name
@@ -331,15 +339,19 @@ def load_signer_maps(path, hostname):
     IP-address keys are normalized, e.g. 2001:DB8:0::1 to 2001:db8::1, to compare
     equal to named(8)'s source addresses. Any other key is a host name, converted
     to an absolute dns.name.Name: a dotted one is taken as already fully
-    qualified, a dotless one is qualified with the domain of `hostname`, this
-    host's name. Raises OSError if the file can't be read, ValueError if it is
-    malformed.
+    qualified, a dotless one is qualified with the file's DEFAULT_DOMAIN_KEY
+    value if it has one, else with the domain of `hostname`, this host's name.
+    The returned signers exclude DEFAULT_DOMAIN_KEY. Raises OSError if the file
+    can't be read, ValueError if it is malformed.
     """
-    host_domain = _host_domain(hostname)
     with open(path) as f:
         raw = json.load(f, object_pairs_hook=_reject_duplicate_keys)
     if not isinstance(raw, dict):
         raise ValueError("top level must be an object of signers")  # noqa: TRY004 -- bad file data
+    if DEFAULT_DOMAIN_KEY in raw:
+        default_domain = _parse_default_domain(raw.pop(DEFAULT_DOMAIN_KEY))
+    else:
+        default_domain = _host_domain(hostname)
     signers = {}
     for signer, entries in raw.items():
         if not isinstance(entries, dict):
@@ -347,7 +359,7 @@ def load_signer_maps(path, hostname):
         maps = signers[signer] = {}
         spelled = {}  # how each key was written, to name both sides of a clash
         for key, allowed in entries.items():
-            source = _parse_source(key, host_domain, hostname)
+            source = _parse_source(key, default_domain, hostname)
             if not _is_valid_value(allowed):
                 raise ValueError(
                     f"signer {signer!r}, {key!r}: value must be"
@@ -383,30 +395,53 @@ def _is_valid_value(allowed):
 _HOSTNAME_LABEL = re.compile(r"[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?\Z")
 
 
-def _parse_source(key, host_domain, hostname):
+def _has_hostname_syntax(text):
+    """Whether `text`, less one trailing dot, is dot-separated RFC 1123 labels."""
+    labels = text[:-1].split(".") if text.endswith(".") else text.split(".")
+    return all(_HOSTNAME_LABEL.match(label) for label in labels)
+
+
+def _parse_default_domain(value):
+    """Convert DEFAULT_DOMAIN_KEY's value `value` to an absolute dns.name.Name,
+    raising ValueError unless it is a plausible domain name.
+    """
+    error = ValueError(f"{DEFAULT_DOMAIN_KEY!r} must be a domain name, not {value!r}")
+    if not isinstance(value, str) or not _has_hostname_syntax(value):
+        raise error
+    try:
+        domain = dns.name.from_text(value)
+    except dns.exception.DNSException:
+        raise error from None
+    # No top-level domain is numeric, so this is most likely an IP address.
+    if domain.labels[-2].isdigit():
+        raise error
+    return domain
+
+
+def _parse_source(key, default_domain, hostname):
     """Convert signer-map key `key` as described in `load_signer_maps`, where
-    `host_domain` is the domain of `hostname`, or None if it has none.
+    `default_domain` qualifies a dotless key, None if there is none, in which
+    case `hostname` is named in the error.
     """
     try:
         return str(ipaddress.ip_address(key))
     except ValueError:
         pass
     # Keys like "10.0.0.0/24", "10.0.0.1:53" or "_comment" are no host names.
-    labels = key[:-1].split(".") if key.endswith(".") else key.split(".")
-    if not all(_HOSTNAME_LABEL.match(label) for label in labels):
+    if not _has_hostname_syntax(key):
         raise ValueError(
             f"{key!r} is neither an IP address nor a host name"
             " (letters, digits and hyphens)"
         )
     if "." in key:
         origin = dns.name.root
-    elif host_domain is None:
+    elif default_domain is None:
         raise ValueError(
             f"{key!r} has no domain, and this host's name {hostname!r} has none"
-            " to qualify it with"
+            f" to qualify it with; set {DEFAULT_DOMAIN_KEY!r} or write it in full"
         )
     else:
-        origin = host_domain
+        origin = default_domain
     try:
         name = dns.name.from_text(key, origin=origin)
     except dns.exception.DNSException as e:

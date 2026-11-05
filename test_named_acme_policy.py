@@ -987,6 +987,69 @@ class TestLoadSignerMaps:
             self._load(tmp_path, {"certbot": {"dtn-2": "*"}}, hostname="dns1")
         assert "this host's name 'dns1'" in str(exc_info.value)
 
+    def test_error_points_at_default_domain_key(self, tmp_path):
+        with pytest.raises(ValueError, match="set '_default_domain'"):
+            self._load(tmp_path, {"certbot": {"dtn-2": "*"}}, hostname="dns1")
+
+    @pytest.mark.parametrize("domain", ["icecube.wisc.edu", "icecube.wisc.edu."])
+    def test_default_domain_qualifies_dotless_names(self, tmp_path, domain):
+        # The dns-3 case: a dotless hostname, so only the file supplies a domain.
+        content = {
+            "_default_domain": domain,
+            "certbot": {"navigator-dev": ["navigator.icecube.wisc.edu"]},
+        }
+        signers = self._load(tmp_path, content, hostname="dns-3")
+        assert signers == {
+            "certbot": {
+                _name("navigator-dev.icecube.wisc.edu."): ["navigator.icecube.wisc.edu"]
+            }
+        }
+
+    def test_default_domain_overrides_the_host_domain(self, tmp_path):
+        content = {"_default_domain": "example.net", "c": {"h": "*"}}
+        assert self._load(tmp_path, content) == {"c": {_name("h.example.net."): "*"}}
+
+    def test_default_domain_leaves_dotted_names_alone(self, tmp_path):
+        content = {"_default_domain": "example.net", "c": {"h.example.com": "*"}}
+        assert self._load(tmp_path, content) == {"c": {_name("h.example.com."): "*"}}
+
+    def test_default_domain_alone_yields_no_signers(self, tmp_path):
+        assert self._load(tmp_path, {"_default_domain": "example.net"}) == {}
+
+    def test_default_domain_spelling_clash_is_rejected(self, tmp_path):
+        content = {
+            "_default_domain": "example.net",
+            "c": {"h": "*", "h.example.net": "*"},
+        }
+        with pytest.raises(ValueError, match="both name h.example.net."):
+            self._load(tmp_path, content)
+
+    @pytest.mark.parametrize(
+        "domain",
+        [
+            "",
+            ".",
+            "a..b",
+            "_x.example.org",
+            "example.org ",
+            "10.0.0.1",
+            "x" * 64 + ".org",
+            ".".join(["a" * 63] * 5),
+            None,
+            5,
+            ["example.org"],
+        ],
+    )
+    def test_bad_default_domain_is_rejected(self, tmp_path, domain):
+        content = {"_default_domain": domain, "c": {"10.0.0.1": "*"}}
+        with pytest.raises(ValueError, match="'_default_domain' must be a domain name"):
+            self._load(tmp_path, content)
+
+    def test_dotless_name_too_long_with_default_domain_is_rejected(self, tmp_path):
+        content = {"_default_domain": ".".join(["a" * 63] * 3), "c": {"b" * 63: "*"}}
+        with pytest.raises(ValueError, match="neither an IP address nor a valid name"):
+            self._load(tmp_path, content)
+
     def test_dotted_name_needs_no_host_domain(self, tmp_path):
         maps = self._load(tmp_path, {"c": {"h.example.net": "*"}}, hostname="dns1")
         assert maps == {"c": {_name("h.example.net."): "*"}}
